@@ -1,0 +1,24 @@
+# Build output
+basidium
+*.o
+*.d
+
+# Session output
+basidium-*.json
+*.pcap
+*.log
+
+# Profiles (user-local, not committed)
+.basidium/
+
+# Editor artifacts
+*.swp
+*.swo
+*~
+.DS_Store
+.vscode/
+.idea/
+
+# Debug builds
+core
+core.*

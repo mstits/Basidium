@@ -1,0 +1,280 @@
+.TH BASIDIUM 8 "April 2026" "Basidium v2.2" "System Administration"
+.SH NAME
+basidium \- multi-threaded Layer-2 stress and hardware evaluation tool
+.SH SYNOPSIS
+.B sudo basidium
+.B \-i
+.I interface
+.RI [ options ]
+.SH DESCRIPTION
+.B Basidium
+is a multi-threaded Layer-2 packet injection utility for stress-testing and
+evaluating network hardware in authorized, airgapped interoperability labs.
+It supports CAM table flooding, gratuitous ARP storms, DHCP starvation,
+802.1Qbb PFC PAUSE injection, IPv6 Neighbor Discovery flooding, IGMP snooping
+exhaustion, LLDP CPU-path stress, STP Topology Change flooding, VLAN range
+cycling, QinQ double-tagging, rate sweeps, burst pacing, switch fail-open
+detection, NCCL correlation, and an optional ncurses TUI.
+.PP
+All injection requires raw socket privileges.
+.B sudo
+or equivalent capability is required.
+.SH OPTIONS
+.SS "Flood Modes (\-M)"
+.TP
+.B mac
+MAC flood \(em fills switch CAM tables with random source MACs (default).
+.TP
+.B arp
+Gratuitous ARP broadcast flood.
+.TP
+.B dhcp
+DHCP Discover starvation flood with random client MACs.
+.TP
+.B pfc
+802.1Qbb Priority Flow Control PAUSE frame flood. Stress-tests RoCE/RDMA
+fabrics. See
+.B \-\-pfc-priority
+and
+.B \-\-pfc-quanta.
+.TP
+.B nd
+IPv6 Neighbor Discovery flood (ICMPv6 Neighbor Solicitation).
+.TP
+.B lldp
+LLDP frame flood targeting the nearest-bridge multicast address.
+Stresses the switch CPU and LLDP neighbor table.
+.TP
+.B stp
+STP Topology Change Notification BPDU flood. Each TCN causes the receiving
+switch to flush its MAC table, driving it into permanent flood mode via
+the spanning-tree control plane.
+.TP
+.B igmp
+IGMPv2 Membership Report flood. Exhausts IGMP snooping tables.
+.SS "Interface & Performance"
+.TP
+.BI \-i " interface"
+Network interface to inject on (required).
+.TP
+.BI \-t " threads"
+Number of worker threads (default: 1, max: 16).
+.TP
+.BI \-r " pps"
+Rate limit in packets per second. 0 = unlimited.
+.TP
+.BI \-J " bytes"
+Ethernet frame size in bytes (60\(en9216, supports jumbo frames).
+.TP
+.BI \-n " count"
+Stop after injecting
+.I count
+frames.
+.SS "VLAN & PFC Options"
+.TP
+.BI \-V " vlan-id"
+Tag frames with 802.1Q VLAN ID (1\(en4094).
+.TP
+.BI \-\-vlan-pcp " 0-7"
+802.1p Priority Code Point bits in the VLAN tag (default: 0).
+.TP
+.BI \-\-vlan-range " end"
+Cycle VLAN IDs randomly from the value given with
+.B \-V
+up to
+.IR end .
+.TP
+.BI \-\-qinq " outer-vid"
+Insert an 802.1ad outer VLAN tag (TPID 0x88A8). Combine with
+.B \-V
+for true double-tagging.
+.TP
+.BI \-\-pfc-priority " 0-7"
+Priority class to pause in PFC mode (default: 3).
+.TP
+.BI \-\-pfc-quanta " value"
+PFC pause quanta 0\(en65535 (default: 65535).
+.SS "Stealth & Targeting"
+.TP
+.BI \-S " OUI"
+Restrict source MAC OUI, e.g.
+.BR 00:11:22 .
+.TP
+.BI \-T " cidr"
+Target IP subnet for embedded IP headers. Repeatable (up to 64).
+.TP
+.B \-L
+Learning mode: sniff and skip observed MAC addresses.
+.TP
+.B \-A
+Adaptive mode: throttle on broadcast storm detection.
+.TP
+.B \-U
+Allow multicast source MACs.
+.TP
+.B \-R
+Randomize DHCP client MAC independently.
+.SS "Burst & Advanced"
+.TP
+.BI \-\-burst " count:gap_ms"
+Send
+.I count
+frames at wire speed then pause
+.I gap_ms
+ms. Bypasses
+.BR \-r .
+.TP
+.B \-\-detect
+Fail-open detection via embedded probe signature.
+.TP
+.BI \-\-payload " pattern"
+MAC flood payload fill:
+.BR zeros ,
+.BR ff ,
+.BR dead \ (0xDEADBEEF),
+.BR incr .
+.SS "Rate Sweep"
+.TP
+.BI \-\-sweep " start:end:step[:hold_s]"
+Ramp injection rate from
+.I start
+to
+.I end
+PPS in
+.I step
+increments, holding each for
+.I hold_s
+seconds (default 10). Exits on completion.
+.SS "Output & Logging"
+.TP
+.B \-v
+Verbose per-thread and live PPS output.
+.TP
+.BI \-l " file"
+JSON event log.
+.TP
+.B \-\-tui
+Ncurses TUI (requires
+.BR "make TUI=1" ).
+.TP
+.BI \-\-report " [file]"
+JSON session report on exit.
+.SS "Network I/O"
+.TP
+.BI \-\-pcap-out " file"
+Write to
+.I .pcap
+instead of injecting.
+.TP
+.BI \-\-pcap-replay " file"
+Replay
+.I .pcap
+onto the interface.
+.SS "NCCL Correlation"
+.TP
+.B \-\-nccl
+Enable NCCL correlation panel in TUI.
+.TP
+.BI \-\-nccl-binary " path"
+Path to nccl-tests binary (implies
+.BR \-\-nccl ).
+.SS "Profiles & Sessions"
+.TP
+.BI \-\-profile " name"
+Load profile from
+.IR ~/.basidium/<name>.conf .
+.TP
+.BI \-\-duration " time"
+Auto-stop: seconds, e.g.
+.BR 30 ;
+minutes, e.g.
+.BR 5m ;
+hours, e.g.
+.BR 2h .
+.SS "Diagnostics"
+.TP
+.B \-\-selftest
+Run 11 built-in packet builder tests and exit.
+.SH EXAMPLES
+.PP
+Unlimited MAC flood, 4 threads:
+.RS
+.B sudo basidium -i eth0 -t 4
+.RE
+.PP
+ARP flood at 5000 pps with TUI:
+.RS
+.B sudo basidium -i eth0 -M arp -r 5000 --tui
+.RE
+.PP
+PFC PAUSE flood on RDMA priority 3:
+.RS
+.B sudo basidium -i eth0 -M pfc --pfc-priority 3 --pfc-quanta 65535
+.RE
+.PP
+IGMP snooping exhaustion, 4 threads:
+.RS
+.B sudo basidium -i eth0 -M igmp -t 4
+.RE
+.PP
+STP TCN BPDU flood:
+.RS
+.B sudo basidium -i eth0 -M stp
+.RE
+.PP
+QinQ double-tagging, outer VID 200, inner VID 100:
+.RS
+.B sudo basidium -i eth0 -V 100 --qinq 200 -t 4
+.RE
+.PP
+Rate sweep 1k\(en50k pps, 5k step, 10s hold, write report:
+.RS
+.B sudo basidium -i eth0 --sweep 1000:50000:5000:10 --report
+.RE
+.PP
+64-frame bursts, 100 ms gaps, 0xDEADBEEF payload, jumbo frames:
+.RS
+.B sudo basidium -i eth0 --burst 64:100 --payload dead -J 1500
+.RE
+.PP
+Fail-open detection with adaptive throttle:
+.RS
+.B sudo basidium -i eth0 --detect -A
+.RE
+.SH FILES
+.TP
+.I ~/.basidium/*.conf
+Named configuration profiles.
+.TP
+.I basidium-YYYYMMDD-HHMMSS.json
+Auto-generated session report.
+.SH DIAGNOSTICS
+Exit status 0 on success. Non-zero on fatal error.
+The
+.B \-\-selftest
+flag runs 11 packet builder tests (MAC, ARP, DHCP, VLAN, PFC, ND, LLDP,
+STP TCN, QinQ, IGMP, payload pattern) and exits 0 if all pass.
+.SH NOTES
+Requires root privileges for raw packet injection via libpcap.
+.PP
+On Linux, NIC statistics are read from
+.IR /sys/class/net/<iface>/statistics/ .
+.PP
+The TUI requires libncurses and must be compiled with
+.BR "make TUI=1" .
+.PP
+PFC PAUSE frames use reserved MAC
+.B 01:80:C2:00:00:01
+and EtherType
+.B 0x8808
+per IEEE 802.3.
+STP TCN BPDUs use 802.3 LLC encapsulation.
+IGMP reports use TTL=1 per RFC 2236.
+.SH SEE ALSO
+.BR pcap (3),
+.BR tcpdump (1),
+.BR iptraf-ng (8)
+.SH AUTHOR
+Matthew Stits <stits@stits.org>
+.br
+https://github.com/mstits/Basidium

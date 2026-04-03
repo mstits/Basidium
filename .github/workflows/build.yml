@@ -1,0 +1,26 @@
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev libncurses-dev
+
+      - name: Build (CLI)
+        run: make clean && make
+
+      - name: Build (TUI)
+        run: make clean && make TUI=1
+
+      - name: Selftest
+        run: sudo ./basidium --selftest
