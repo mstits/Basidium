@@ -651,7 +651,8 @@ void *worker_func(void *arg) {
     }
 
     struct ether_header_custom *eth = (struct ether_header_custom *)buffer;
-    uint64_t local_sent = 0;
+    uint64_t local_sent   = 0;
+    int      inject_warned = 0;  /* emit at most one permission warning */
 
     /* fast path: mode 0, no stealth/learning/targeting/VLAN-range */
     int use_fast_mac = (conf.mode == 0 && !conf.learning && !conf.stealth &&
@@ -716,6 +717,12 @@ void *worker_func(void *arg) {
             local_sent++;
         } else if (pcap_inject(inj, buffer, len) > 0) {
             local_sent++;
+            inject_warned = 0;  /* clear on success */
+        } else if (!inject_warned) {
+            inject_warned = 1;
+            warnx("Worker %d: injection failed: %s — try running with sudo",
+                  thread_id, pcap_geterr(inj));
+            log_event("error", "injection failed — try running with sudo");
         }
 
         /* Burst mode: send burst_count frames back-to-back, then pause gap_ms */
