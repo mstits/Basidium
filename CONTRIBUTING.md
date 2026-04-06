@@ -13,10 +13,12 @@ All contributions must be for authorized, defensive, or diagnostic use cases. Pu
    make clean && make
    make clean && make TUI=1
    ```
-4. Run the selftest suite:
+4. Run the test suite (no root required):
    ```sh
-   sudo make selftest
+   make check
    ```
+   This runs all 12 packet builder selftests plus dry-run smoke tests across
+   multiple modes. For live injection testing, use `sudo make selftest`.
 5. Open a pull request with a clear description of what changed and why
 
 ## Code Style

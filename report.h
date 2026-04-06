@@ -1,6 +1,9 @@
 /*
  * report.h — session report writer
  *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Matthew Stits
+ *
  * Writes a JSON report at end-of-session capturing config, timing,
  * throughput, sweep results, NCCL busbw, and NIC error counters.
  */

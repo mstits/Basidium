@@ -2,6 +2,9 @@ CC      = gcc
 CFLAGS  = -Wall -Wextra -Wformat=2 -O2 -D_FORTIFY_SOURCE=2
 LDFLAGS = -lpcap -pthread
 
+VERSION = 2.3
+CFLAGS += -DBASIDIUM_VERSION=\"$(VERSION)\"
+
 TARGET  = basidium
 SRC     = basidium.c flood.c nccl.c profiles.c nic_stats.c report.c
 
@@ -21,7 +24,14 @@ $(TARGET): $(SRC)
 selftest: $(TARGET)
 	sudo ./$(TARGET) --selftest
 
-debug: CFLAGS := -Wall -Wextra -g -DDEBUG -O0
+check: $(TARGET)
+	./$(TARGET) --selftest
+	./$(TARGET) --dry-run -M arp -n 100
+	./$(TARGET) --dry-run -M pfc -n 100
+	./$(TARGET) --dry-run -M igmp -n 100
+	@echo "All checks passed."
+
+debug: CFLAGS := -Wall -Wextra -g -DDEBUG -O0 -DBASIDIUM_VERSION=\"$(VERSION)\"
 debug: $(TARGET)
 
 PREFIX  ?= /usr/local
@@ -39,4 +49,4 @@ uninstall:
 clean:
 	rm -f $(TARGET)
 
-.PHONY: all selftest debug clean install uninstall
+.PHONY: all selftest check debug clean install uninstall

@@ -1,5 +1,9 @@
 /*
  * profiles.h — save/load named config profiles
+ *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Matthew Stits
+ *
  * Stored as key=value text files in ~/.basidium/<name>.conf
  */
 #ifndef PROFILES_H

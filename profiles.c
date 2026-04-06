@@ -1,8 +1,13 @@
 /*
  * profiles.c — named config profile save/load
+ *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Matthew Stits
  */
+#define _GNU_SOURCE
 #include "profiles.h"
 
+#include <ctype.h>
 #include <dirent.h>
 #include <pwd.h>
 #include <stdio.h>
@@ -10,6 +15,25 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+/*
+ * Sanitize a profile name to prevent path traversal.
+ * Rejects names containing '/', '..', or starting with '.'.
+ * Returns 1 if safe, 0 if rejected.
+ */
+static int profile_name_safe(const char *name) {
+    if (!name || name[0] == '\0') return 0;
+    if (name[0] == '.') return 0;
+    if (strstr(name, "..")) return 0;
+    if (strchr(name, '/')) return 0;
+    if (strchr(name, '\\')) return 0;
+    /* only allow alphanumeric, dash, underscore */
+    for (const char *p = name; *p; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_')
+            return 0;
+    }
+    return 1;
+}
 
 void profiles_dir(char *out, size_t len) {
     const char *home = getenv("HOME");
@@ -25,6 +49,8 @@ static void ensure_dir(const char *path) {
 }
 
 int profiles_save(const char *name, const struct config *conf) {
+    if (!profile_name_safe(name)) return -1;
+
     char dir[PROFILE_DIR_MAX];
     profiles_dir(dir, sizeof(dir));
     ensure_dir(dir);
@@ -37,7 +63,7 @@ int profiles_save(const char *name, const struct config *conf) {
 
     fprintf(fp, "# Basidium profile: %s\n", name);
     fprintf(fp, "interface=%s\n",        conf->interface ? conf->interface : "");
-    fprintf(fp, "mode=%d\n",             conf->mode);
+    fprintf(fp, "mode=%s\n",             mode_to_string(conf->mode));
     fprintf(fp, "threads=%d\n",          conf->threads);
     fprintf(fp, "pps=%d\n",              conf->pps);
     fprintf(fp, "packet_size=%d\n",      conf->packet_size);
@@ -71,6 +97,8 @@ int profiles_save(const char *name, const struct config *conf) {
 }
 
 int profiles_load(const char *name, struct config *conf) {
+    if (!profile_name_safe(name)) return -1;
+
     char dir[PROFILE_DIR_MAX];
     profiles_dir(dir, sizeof(dir));
 
@@ -88,7 +116,7 @@ int profiles_load(const char *name, struct config *conf) {
         if (sscanf(line, "%63[^=]=%255[^\n]", key, val) != 2) continue;
 
         if      (strcmp(key, "interface")         == 0) { free(conf->interface); conf->interface = strdup(val); }
-        else if (strcmp(key, "mode")              == 0) conf->mode             = atoi(val);
+        else if (strcmp(key, "mode")              == 0) conf->mode             = mode_from_string(val);
         else if (strcmp(key, "threads")           == 0) conf->threads          = atoi(val);
         else if (strcmp(key, "pps")               == 0) conf->pps              = atoi(val);
         else if (strcmp(key, "packet_size")       == 0) conf->packet_size      = atoi(val);
@@ -96,9 +124,9 @@ int profiles_load(const char *name, struct config *conf) {
         else if (strcmp(key, "stealth_oui")       == 0) {
             unsigned int a, b, c;
             if (sscanf(val, "%x:%x:%x", &a, &b, &c) == 3) {
-                conf->stealth_oui[0] = a;
-                conf->stealth_oui[1] = b;
-                conf->stealth_oui[2] = c;
+                conf->stealth_oui[0] = (uint8_t)(a & 0xFF);
+                conf->stealth_oui[1] = (uint8_t)(b & 0xFF);
+                conf->stealth_oui[2] = (uint8_t)(c & 0xFF);
             }
         }
         else if (strcmp(key, "learning")          == 0) conf->learning         = atoi(val);

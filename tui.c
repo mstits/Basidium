@@ -1,8 +1,10 @@
 /*
- * tui.c — ncurses TUI
+ * tui.c — ncurses TUI for Basidium
  *
- * Features:
- *   - Standby mode: press [s]/Enter to begin injecting
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Matthew Stits
+ *
+ * iptraf-ng inspired panel layout with live statistics:
  *   - Live stats: PPS, total, uptime, session countdown
  *   - ASCII sparkline: 50-sample rolling PPS history
  *   - Per-thread PPS breakdown
@@ -13,6 +15,7 @@
  */
 #ifdef HAVE_TUI
 
+#define _GNU_SOURCE
 #include "tui.h"
 #include "flood.h"
 #include "nccl.h"
@@ -282,15 +285,7 @@ void tui_init(void) {
     last_tick = time(NULL);
 
     tui_log("Ready — iface: %s  mode: %s  threads: %d",
-            conf.interface,
-            conf.mode == 1 ? "ARP flood"       :
-            conf.mode == 2 ? "DHCP starvation"  :
-            conf.mode == 3 ? "PFC PAUSE flood"  :
-            conf.mode == 4 ? "ND flood"          :
-            conf.mode == 5 ? "LLDP flood"        :
-            conf.mode == 6 ? "STP TCN flood"     :
-            conf.mode == 7 ? "IGMP flood"        : "MAC flood",
-            conf.threads);
+            conf.interface, mode_to_string(conf.mode), conf.threads);
     if (conf.session_duration > 0)
         tui_log("Session timer: %d seconds", conf.session_duration);
     tui_log("Press [s] or Enter to begin injecting");
@@ -899,16 +894,9 @@ void tui_draw(void) {
     box(w_header, 0, 0);
     wattron(w_header, COLOR_PAIR(CP_HEADER) | A_BOLD);
 
-    const char *mode_str = conf.mode == 1 ? "ARP FLOOD"        :
-                           conf.mode == 2 ? "DHCP STARVATION"  :
-                           conf.mode == 3 ? "PFC PAUSE FLOOD"  :
-                           conf.mode == 4 ? "ND FLOOD"          :
-                           conf.mode == 5 ? "LLDP FLOOD"        :
-                           conf.mode == 6 ? "STP TCN FLOOD"     :
-                           conf.mode == 7 ? "IGMP FLOOD"         : "MAC FLOOD";
-    mvwprintw(w_header, 1, 2,  "Basidium v2.2");
+    mvwprintw(w_header, 1, 2,  "Basidium v%s", BASIDIUM_VERSION);
     mvwprintw(w_header, 1, 18, "iface: %-10s", conf.interface ? conf.interface : "?");
-    mvwprintw(w_header, 1, 36, "mode: %-16s", mode_str);
+    mvwprintw(w_header, 1, 36, "mode: %-16s", mode_to_string(conf.mode));
 
     const char *status_str;
     int status_cp;
@@ -1009,15 +997,7 @@ void tui_draw(void) {
     mvwprintw(w_config, 0, 2, " CONFIGURATION ");
     wattroff(w_config, A_BOLD);
 
-    const char *mode_label = conf.mode == 1 ? "ARP flood"       :
-                             conf.mode == 2 ? "DHCP starvation"  :
-                             conf.mode == 3 ? "PFC PAUSE flood"  :
-                             conf.mode == 4 ? "ND flood"          :
-                             conf.mode == 5 ? "LLDP flood"        :
-                             conf.mode == 6 ? "STP TCN flood"     :
-                             conf.mode == 7 ? "IGMP flood"        : "MAC flood";
-
-    mvwprintw(w_config, 1, 2, "Mode:    %s", mode_label);
+    mvwprintw(w_config, 1, 2, "Mode:    %s", mode_to_string(conf.mode));
 
     /* Rate / sweep display */
     if (conf.sweep_enabled && (int)sweep_total_steps > 0) {
@@ -1050,13 +1030,13 @@ void tui_draw(void) {
         mvwprintw(w_config, 7, 2, "Duration: %ds", conf.session_duration);
 
     /* VLAN and PFC status on the last row */
-    if (conf.vlan_id > 0 && conf.mode == 3)
+    if (conf.vlan_id > 0 && conf.mode == MODE_PFC)
         mvwprintw(w_config, 8, 2, "VLAN: n/a (PFC)  PFC pri:%d q:0x%04x",
                   conf.pfc_priority, conf.pfc_quanta);
     else if (conf.vlan_id > 0)
         mvwprintw(w_config, 8, 2, "VLAN: %d  pcp:%d",
                   conf.vlan_id, conf.vlan_pcp);
-    else if (conf.mode == 3)
+    else if (conf.mode == MODE_PFC)
         mvwprintw(w_config, 8, 2, "PFC pri:%d  quanta:0x%04x",
                   conf.pfc_priority, conf.pfc_quanta);
 
@@ -1149,6 +1129,7 @@ int tui_input(int ch) {
 
     case 's': case 'S': case '\n': case KEY_ENTER:
         if (!is_started) {
+            start_time = time(NULL);  /* begin duration timer from actual start */
             atomic_store(&is_started, 1);
             tui_log("Started — injecting on %s", conf.interface);
         }
@@ -1185,9 +1166,9 @@ int tui_input(int ch) {
             } else {
                 unsigned int a, b, c;
                 if (sscanf(buf, "%x:%x:%x", &a, &b, &c) == 3) {
-                    conf.stealth_oui[0] = a;
-                    conf.stealth_oui[1] = b;
-                    conf.stealth_oui[2] = c;
+                    conf.stealth_oui[0] = (uint8_t)(a & 0xFF);
+                    conf.stealth_oui[1] = (uint8_t)(b & 0xFF);
+                    conf.stealth_oui[2] = (uint8_t)(c & 0xFF);
                     conf.stealth = 1;
                     tui_log("OUI: %02x:%02x:%02x", a, b, c);
                 } else {

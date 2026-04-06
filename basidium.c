@@ -1,6 +1,9 @@
 /*
- * basidium.c v2.2
+ * basidium.c v2.3
  * Basidium — Advanced Multi-Threaded Layer-2 Stress / Hardware Evaluation Utility
+ *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Matthew Stits
  *
  * Author:  Matthew Stits <stits@stits.org>
  * GitHub:  https://github.com/mstits/Basidium
@@ -31,6 +34,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef BASIDIUM_VERSION
+#define BASIDIUM_VERSION "2.3"
+#endif
+
 /* ---- Global state definitions (extern'd in flood.h) ---- */
 struct config     conf;
 atomic_ullong     total_sent      = 0;
@@ -54,14 +61,15 @@ pthread_mutex_t   learn_mutex     = PTHREAD_MUTEX_INITIALIZER;
 time_t            start_time      = 0;
 
 /* ---- Signal handler ---- */
-static void handle_sigint(int sig) {
+static void handle_signal(int sig) {
     (void)sig;
     atomic_store(&is_running, 0);
 }
 
 /* ---- Usage ---- */
 static void usage(void) {
-    printf("\n\033[1mBasidium v2.2\033[0m - \033[36mLayer-2 Hardware Stress & Evaluation Tool\033[0m\n");
+    printf("\n\033[1mBasidium v%s\033[0m - \033[36mLayer-2 Hardware Stress & Evaluation Tool\033[0m\n",
+           BASIDIUM_VERSION);
     printf("================================================================\n\n");
 
     printf("\033[1mUSAGE:\033[0m\n");
@@ -131,7 +139,9 @@ static void usage(void) {
     printf("  --payload <pattern>     MAC flood payload fill: zeros ff dead incr (default: zeros)\n\n");
 
     printf("\033[1mDIAGNOSTICS:\033[0m\n");
-    printf("  --selftest   Run built-in packet builder validation suite\n\n");
+    printf("  --selftest   Run built-in packet builder validation suite\n");
+    printf("  --version    Print version and exit\n");
+    printf("  --dry-run    Build & count packets without injecting (no sudo needed)\n\n");
 
     printf("\033[1mEXAMPLES:\033[0m\n");
     printf("  sudo ./basidium -i eth0 -t 4\n");
@@ -159,8 +169,8 @@ int main(int argc, char **argv) {
         errx(1, "malloc failed");
 
     conf.threads      = 1;
-    conf.pfc_priority = 3;       /* RDMA/RoCE default priority */
-    conf.pfc_quanta   = 0xFFFF;  /* max pause duration */
+    conf.pfc_priority = 3;
+    conf.pfc_quanta   = 0xFFFF;
 
     static struct option long_options[] = {
         {"selftest",     no_argument,       0, 0},
@@ -181,6 +191,8 @@ int main(int argc, char **argv) {
         {"detect",       no_argument,       0, 0},
         {"qinq",         required_argument, 0, 0},
         {"payload",      required_argument, 0, 0},
+        {"version",      no_argument,       0, 0},
+        {"dry-run",      no_argument,       0, 0},
         {0, 0, 0, 0}
     };
 
@@ -190,6 +202,7 @@ int main(int argc, char **argv) {
         if (opt == 0) {
             const char *name = long_options[option_index].name;
             if (strcmp(name, "selftest")    == 0) conf.self_test      = 1;
+            if (strcmp(name, "dry-run")     == 0) conf.dry_run        = 1;
             if (strcmp(name, "pcap-out")    == 0) conf.pcap_out_file  = strdup(optarg);
             if (strcmp(name, "pcap-replay") == 0) conf.pcap_replay_file = strdup(optarg);
             if (strcmp(name, "tui")         == 0) conf.tui            = 1;
@@ -200,8 +213,11 @@ int main(int argc, char **argv) {
             if (strcmp(name, "pfc-priority")== 0) conf.pfc_priority  = atoi(optarg) & 0x7;
             if (strcmp(name, "pfc-quanta")  == 0) conf.pfc_quanta    = (int)strtol(optarg, NULL, 0);
             if (strcmp(name, "report")      == 0) conf.report_path   = optarg ? strdup(optarg) : strdup("");
+            if (strcmp(name, "version")     == 0) {
+                printf("Basidium v%s\n", BASIDIUM_VERSION);
+                exit(0);
+            }
             if (strcmp(name, "sweep")       == 0) {
-                /* format: start:end:step[:hold_seconds] */
                 int a = 0, b = 0, c = 0, d = 10;
                 int n = sscanf(optarg, "%d:%d:%d:%d", &a, &b, &c, &d);
                 if (n < 3)
@@ -239,7 +255,6 @@ int main(int argc, char **argv) {
                     errx(1, "--qinq: outer VID must be 1-4094");
             }
             if (strcmp(name, "duration")    == 0) {
-                /* accept: 30, 5m, 2h */
                 char *end;
                 int val = (int)strtol(optarg, &end, 10);
                 if      (*end == 'm') val *= 60;
@@ -256,13 +271,9 @@ int main(int argc, char **argv) {
                 errx(1, "VLAN ID must be 0-4094");
             break;
         case 'M':
-            conf.mode = (strcmp(optarg, "arp")  == 0) ? 1 :
-                        (strcmp(optarg, "dhcp") == 0) ? 2 :
-                        (strcmp(optarg, "pfc")  == 0) ? 3 :
-                        (strcmp(optarg, "nd")   == 0) ? 4 :
-                        (strcmp(optarg, "lldp") == 0) ? 5 :
-                        (strcmp(optarg, "stp")  == 0) ? 6 :
-                        (strcmp(optarg, "igmp") == 0) ? 7 : 0;
+            conf.mode = mode_from_string(optarg);
+            if (conf.mode == MODE_INVALID)
+                errx(1, "Unknown mode '%s' — valid: mac arp dhcp pfc nd lldp stp igmp", optarg);
             break;
         case 't': conf.threads          = atoi(optarg); break;
         case 'r': conf.pps              = atoi(optarg); break;
@@ -274,11 +285,16 @@ int main(int argc, char **argv) {
         case 'U': conf.allow_multicast  = 1;            break;
         case 'v': conf.verbose          = 1;            break;
         case 'l': conf.log_file         = strdup(optarg); break;
-        case 'S':
+        case 'S': {
             conf.stealth = 1;
-            sscanf(optarg, "%hhx:%hhx:%hhx",
-                   &conf.stealth_oui[0], &conf.stealth_oui[1], &conf.stealth_oui[2]);
+            unsigned int a, b, c;
+            if (sscanf(optarg, "%x:%x:%x", &a, &b, &c) == 3) {
+                conf.stealth_oui[0] = (uint8_t)(a & 0xFF);
+                conf.stealth_oui[1] = (uint8_t)(b & 0xFF);
+                conf.stealth_oui[2] = (uint8_t)(c & 0xFF);
+            }
             break;
+        }
         case 'T':
             if (conf.target_count < MAX_TARGETS) {
                 char ip_str[32];
@@ -306,8 +322,19 @@ int main(int argc, char **argv) {
     }
 #endif
 
+    /* Dry-run mode: use pcap_open_dead, no interface required, no sudo */
+    if (conf.dry_run) {
+        pcap_t *dead = pcap_open_dead(DLT_EN10MB, MAX_PACKET_SIZE);
+        if (!dead) errx(1, "pcap_open_dead failed");
+        global_pd = pcap_dump_open(dead, "/dev/null");
+        if (!global_pd) errx(1, "pcap_dump_open /dev/null failed");
+        conf.threads = 1;
+        if (!conf.interface) conf.interface = "dry-run";
+        printf("Dry-run mode: building packets, no injection\n");
+    }
+
     /* PCAP output mode */
-    if (conf.pcap_out_file) {
+    if (conf.pcap_out_file && !conf.dry_run) {
         pcap_t *dead = pcap_open_dead(DLT_EN10MB, 65535);
         if (!dead) errx(1, "pcap_open_dead failed");
         global_pd = pcap_dump_open(dead, conf.pcap_out_file);
@@ -317,11 +344,12 @@ int main(int argc, char **argv) {
         printf("PCAP output mode: writing to %s\n", conf.pcap_out_file);
     }
 
-    if (!conf.interface) usage();
+    if (!conf.interface && !conf.dry_run) usage();
     if (conf.threads < 1 || conf.threads > MAX_THREADS)
         errx(1, "Thread count must be 1-%d", MAX_THREADS);
 
-    signal(SIGINT, handle_sigint);
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
     start_time = time(NULL);
     log_event("START", "Stress test started");
 
@@ -334,7 +362,7 @@ int main(int argc, char **argv) {
         if (!conf.tui)
             printf("Sniffer running (learning=%d adaptive=%d detect=%d)\n",
                    conf.learning, conf.adaptive, conf.detect_failopen);
-        sleep(1); /* brief warm-up to capture existing MACs */
+        sleep(1);
     }
 
     /* CLI mode starts immediately; TUI mode waits for user keypress */
@@ -345,11 +373,10 @@ int main(int argc, char **argv) {
     pthread_t workers[MAX_THREADS];
     int thread_ids[MAX_THREADS];
 
-    /* Rate sweep thread — runs alongside workers, adjusts conf.pps each step */
+    /* Rate sweep thread */
     pthread_t sweep_th;
     int sweep_running = 0;
     if (conf.sweep_enabled) {
-        /* override pps with sweep start so workers begin at the right rate */
         conf.pps = conf.sweep_start;
         pthread_create(&sweep_th, NULL, sweep_thread_func, NULL);
         sweep_running = 1;
@@ -359,7 +386,7 @@ int main(int argc, char **argv) {
                    conf.sweep_step, conf.sweep_hold);
     }
 
-    /* PCAP replay mode spawns a single replay thread instead of flood workers */
+    /* PCAP replay mode */
     pthread_t replay_th;
     int replay_running = 0;
 
@@ -381,15 +408,8 @@ int main(int argc, char **argv) {
 #ifdef HAVE_TUI
     if (conf.tui) {
         tui_init();
-        const char *mode_str = conf.mode == 1 ? "ARP flood"       :
-                               conf.mode == 2 ? "DHCP starvation"  :
-                               conf.mode == 3 ? "PFC PAUSE flood"  :
-                               conf.mode == 4 ? "ND flood"          :
-                               conf.mode == 5 ? "LLDP flood"        :
-                               conf.mode == 6 ? "STP TCN flood"     :
-                               conf.mode == 7 ? "IGMP flood"         : "MAC flood";
         tui_log("Started %s on %s (%d thread%s)",
-                mode_str, conf.interface, conf.threads,
+                mode_to_string(conf.mode), conf.interface, conf.threads,
                 conf.threads == 1 ? "" : "s");
 
         while (is_running) {
@@ -398,11 +418,18 @@ int main(int argc, char **argv) {
                 atomic_store(&is_running, 0);
                 break;
             }
+            /* Session duration auto-stop — now enforced in TUI mode */
+            if (conf.session_duration > 0 && is_started &&
+                (time(NULL) - start_time) >= conf.session_duration) {
+                tui_log("Session timer expired (%ds)", conf.session_duration);
+                atomic_store(&is_running, 0);
+                break;
+            }
             int ch = getch();
             if (ch != ERR && tui_input(ch))
                 atomic_store(&is_running, 0);
             tui_draw();
-            usleep(100000); /* 100ms refresh */
+            usleep(100000);
         }
         tui_cleanup();
     } else
@@ -444,7 +471,7 @@ int main(int argc, char **argv) {
             pthread_join(workers[i], NULL);
 
     if (sniff_running) {
-        atomic_store(&is_running, 0); /* ensure sniffer exits */
+        atomic_store(&is_running, 0);
         pthread_join(sniff_th, NULL);
     }
 
@@ -466,5 +493,10 @@ int main(int argc, char **argv) {
     }
 
     free(learned_macs);
+
+    /* Exit 2 if fail-open was detected (scriptable for SRE alerting) */
+    if (conf.detect_failopen && fail_open_detected)
+        return 2;
+
     return 0;
 }

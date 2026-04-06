@@ -1,9 +1,16 @@
 /*
  * nccl.h — NCCL test orchestration and result tracking
  *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Matthew Stits
+ *
  * Launches nccl-tests binaries (all_reduce_perf, etc.) as subprocesses,
  * parses busbw output, and surfaces results to the TUI for correlation
  * with active flood/stress operations.
+ *
+ * NOTE: NCCL-tests require Linux + NVIDIA GPUs with CUDA. On macOS/BSD
+ * the --nccl flag is accepted and the module compiles, but nccl_start()
+ * will fail gracefully if the binary is not found (popen returns NULL).
  */
 #ifndef NCCL_MODULE_H
 #define NCCL_MODULE_H

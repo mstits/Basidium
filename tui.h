@@ -1,6 +1,9 @@
 /*
  * tui.h — ncurses TUI interface
  *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Matthew Stits
+ *
  * iptraf-ng inspired layout:
  *   ┌─ header ──────────────────────────────────────────┐
  *   │ Basidium  iface  mode  status                     │

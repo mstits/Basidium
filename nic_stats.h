@@ -1,8 +1,11 @@
 /*
- * nic_stats.h — NIC-level TX/RX counters via /sys/class/net (Linux)
+ * nic_stats.h — NIC-level TX/RX counters
  *
- * On non-Linux systems, nic_stats_read() returns -1 and zeroes all fields.
- * Check the return value before displaying stats in the TUI.
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Matthew Stits
+ *
+ * Linux: reads from /sys/class/net/. macOS/BSD: getifaddrs() + AF_LINK if_data.
+ * On unsupported platforms, nic_stats_read() returns -1 and zeroes all fields.
  */
 #ifndef NIC_STATS_H
 #define NIC_STATS_H

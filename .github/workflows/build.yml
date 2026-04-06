@@ -7,7 +7,7 @@ on:
     branches: [ main ]
 
 jobs:
-  build:
+  build-linux:
     runs-on: ubuntu-latest
 
     steps:
@@ -23,4 +23,31 @@ jobs:
         run: make clean && make TUI=1
 
       - name: Selftest
-        run: sudo ./basidium --selftest
+        run: ./basidium --selftest
+
+      - name: Dry-run smoke test
+        run: ./basidium --dry-run -M arp -n 100
+
+      - name: Version check
+        run: ./basidium --version
+
+  build-macos:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (CLI)
+        run: make clean && make
+
+      - name: Build (TUI)
+        run: make clean && make TUI=1
+
+      - name: Selftest
+        run: ./basidium --selftest
+
+      - name: Dry-run smoke test
+        run: ./basidium --dry-run -M arp -n 100
+
+      - name: Version check
+        run: ./basidium --version

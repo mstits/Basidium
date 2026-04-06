@@ -1,6 +1,9 @@
 /*
  * nccl.c — NCCL test orchestration
  *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Matthew Stits
+ *
  * Runs nccl-tests binaries (e.g. all_reduce_perf) as a subprocess via popen(),
  * parses their tabular output, and stores results for TUI correlation display.
  *
@@ -8,6 +11,7 @@
  *   #       size  count  type  redop    time  algbw  busbw  ...
  *   33554432  8388608  float  sum  820.5  40.89  76.67  N/A  ...
  */
+#define _GNU_SOURCE
 #include "nccl.h"
 
 #include <pthread.h>

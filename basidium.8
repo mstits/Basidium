@@ -1,4 +1,4 @@
-.TH BASIDIUM 8 "April 2026" "Basidium v2.2" "System Administration"
+.TH BASIDIUM 8 "April 2026" "Basidium v2.3" "System Administration"
 .SH NAME
 basidium \- multi-threaded Layer-2 stress and hardware evaluation tool
 .SH SYNOPSIS
@@ -194,7 +194,15 @@ hours, e.g.
 .SS "Diagnostics"
 .TP
 .B \-\-selftest
-Run 11 built-in packet builder tests and exit.
+Run 12 built-in packet builder validation tests and exit.
+.TP
+.B \-\-version
+Print version and exit.
+.TP
+.B \-\-dry\-run
+Build and count packets without injecting. Does not require root
+or an active network interface. Useful for validating configuration
+and estimating packet builder throughput.
 .SH EXAMPLES
 .PP
 Unlimited MAC flood, 4 threads:
@@ -249,11 +257,14 @@ Named configuration profiles.
 .I basidium-YYYYMMDD-HHMMSS.json
 Auto-generated session report.
 .SH DIAGNOSTICS
-Exit status 0 on success. Non-zero on fatal error.
+Exit status 0 on success, 1 on fatal error, 2 if fail-open was detected
+(when using
+.BR \-\-detect ).
+.PP
 The
 .B \-\-selftest
-flag runs 11 packet builder tests (MAC, ARP, DHCP, VLAN, PFC, ND, LLDP,
-STP TCN, QinQ, IGMP, payload pattern) and exits 0 if all pass.
+flag runs 12 packet builder tests (MAC, ARP, DHCP, VLAN, PFC, ND, LLDP,
+STP TCN, QinQ, IGMP, payload pattern, IP checksum) and exits 0 if all pass.
 .SH NOTES
 Requires root privileges for raw packet injection via libpcap.
 .PP

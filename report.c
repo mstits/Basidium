@@ -1,6 +1,10 @@
 /*
  * report.c — JSON session report writer
+ *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Matthew Stits
  */
+#define _GNU_SOURCE
 #include "report.h"
 #include "flood.h"
 #include "nccl.h"
@@ -9,19 +13,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-
-static const char *mode_name(int mode) {
-    switch (mode) {
-    case 1:  return "arp";
-    case 2:  return "dhcp";
-    case 3:  return "pfc";
-    case 4:  return "nd";
-    case 5:  return "lldp";
-    case 6:  return "stp";
-    case 7:  return "igmp";
-    default: return "mac";
-    }
-}
 
 static void write_esc(FILE *fp, const char *s) {
     /* minimal JSON string escaping */
@@ -64,14 +55,14 @@ void write_report(const char *path, const struct nic_stats *final_nic) {
     fprintf(fp, "  \"interface\": ");
     write_esc(fp, conf.interface ? conf.interface : "");
     fprintf(fp, ",\n");
-    fprintf(fp, "  \"mode\": \"%s\",\n", mode_name(conf.mode));
+    fprintf(fp, "  \"mode\": \"%s\",\n", mode_to_string(conf.mode));
     fprintf(fp, "  \"threads\": %d,\n", conf.threads);
 
     if (conf.vlan_id > 0)
         fprintf(fp, "  \"vlan_id\": %d,\n  \"vlan_pcp\": %d,\n",
                 conf.vlan_id, conf.vlan_pcp);
 
-    if (conf.mode == 3)
+    if (conf.mode == MODE_PFC)
         fprintf(fp, "  \"pfc_priority\": %d,\n  \"pfc_quanta\": %d,\n",
                 conf.pfc_priority, conf.pfc_quanta);
 

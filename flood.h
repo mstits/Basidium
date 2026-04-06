@@ -1,10 +1,12 @@
 /*
  * flood.h — shared types, globals, and function prototypes
+ *
+ * SPDX-License-Identifier: MIT
+ * Copyright (c) 2026 Matthew Stits
  */
 #ifndef FLOOD_H
 #define FLOOD_H
 
-#define _GNU_SOURCE
 #include <pcap.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -12,11 +14,34 @@
 #include <time.h>
 
 /* ---- compile-time limits ---- */
-#define MAX_PACKET_SIZE  9216
-#define ETHER_ADDR_LEN   6
-#define MAX_THREADS      16
-#define MAX_TARGETS      64
-#define MAX_LEARNED_MACS 4096
+#define MAX_PACKET_SIZE    9216
+#define ETHER_ADDR_LEN     6
+#define MAX_THREADS        16
+#define MAX_TARGETS        64
+#define MAX_LEARNED_MACS   4096
+#define MAX_INJECT_FAILURES 256   /* consecutive inject fails before worker exits */
+
+/* ---- flood modes ---- */
+typedef enum {
+    MODE_INVALID = -1,
+    MODE_MAC  = 0,
+    MODE_ARP  = 1,
+    MODE_DHCP = 2,
+    MODE_PFC  = 3,
+    MODE_ND   = 4,
+    MODE_LLDP = 5,
+    MODE_STP  = 6,
+    MODE_IGMP = 7,
+} flood_mode_t;
+
+const char *mode_to_string(flood_mode_t mode);
+flood_mode_t mode_from_string(const char *str);
+
+/* ---- fast RNG (Xorshift128+) ---- */
+struct rng_state { uint64_t s[2]; };
+void rng_init(struct rng_state *rng, int seed_offset);
+uint64_t xorshift128plus(uint64_t s[2]);
+uint32_t rng_rand(struct rng_state *rng);  /* drop-in rand() replacement */
 
 /* ---- ethertypes ---- */
 #define ETHERTYPE_IP    0x0800
@@ -107,11 +132,11 @@ struct igmp_header {
 };
 
 struct config {
-    char    *interface;
-    int      count;
-    int      pps;
-    int      threads;
-    int      mode;               /* 0=MAC, 1=ARP, 2=DHCP, 3=PFC, 4=ND, 5=LLDP, 6=STP, 7=IGMP */
+    char        *interface;
+    int          count;
+    int          pps;
+    int          threads;
+    flood_mode_t mode;
     int      stealth;
     uint8_t  stealth_oui[3];
     int      learning;
@@ -149,6 +174,7 @@ struct config {
     int      detect_failopen;    /* --detect: start sniffer, watch for echoed probe frames */
     int      qinq_outer_vid;    /* --qinq: 802.1ad outer VLAN ID (0=disabled, 1-4094) */
     int      payload_pattern;  /* --payload: 0=zeros(default), 1=ff, 2=dead, 3=incr */
+    int      dry_run;          /* --dry-run: build & count packets without injecting */
 };
 
 /* ---- shared state (defined in basidium.c) ---- */
@@ -178,20 +204,21 @@ extern unsigned long long sweep_step_pps[MAX_SWEEP_STEPS]; /* achieved PPS per s
 
 /* ---- flood.c prototypes ---- */
 void     log_event(const char *type, const char *msg);
-void     randomize_mac(uint8_t *mac);
+void     randomize_mac(uint8_t *mac, struct rng_state *rng);
 int      is_learned_mac(uint8_t *mac);
-uint32_t get_target_ip(void);
-void     vlan_tag_frame(uint8_t *buffer, int *len);  /* insert 802.1Q tag in-place */
-void     qinq_tag_frame(uint8_t *buffer, int *len);  /* insert 802.1ad outer tag in-place */
+uint32_t get_target_ip(struct rng_state *rng);
+uint16_t ip_checksum(const void *data, int len);
+void     vlan_tag_frame(uint8_t *buffer, int *len, struct rng_state *rng);
+void     qinq_tag_frame(uint8_t *buffer, int *len);
 void    *sniffer_thread_func(void *arg);
-int      build_packet_mac(uint8_t *buffer);
-int      build_packet_arp(uint8_t *buffer);
-int      build_packet_dhcp(uint8_t *buffer);
-int      build_packet_pfc(uint8_t *buffer);          /* 802.1Qbb PFC PAUSE */
-int      build_packet_nd(uint8_t *buffer);           /* IPv6 Neighbor Discovery flood */
-int      build_packet_lldp(uint8_t *buffer);         /* LLDP frame */
-int      build_packet_stp(uint8_t *buffer);          /* STP TCN BPDU */
-int      build_packet_igmp(uint8_t *buffer);         /* IGMPv2 Membership Report flood */
+int      build_packet_mac(uint8_t *buffer, struct rng_state *rng);
+int      build_packet_arp(uint8_t *buffer, struct rng_state *rng);
+int      build_packet_dhcp(uint8_t *buffer, struct rng_state *rng);
+int      build_packet_pfc(uint8_t *buffer, struct rng_state *rng);
+int      build_packet_nd(uint8_t *buffer, struct rng_state *rng);
+int      build_packet_lldp(uint8_t *buffer, struct rng_state *rng);
+int      build_packet_stp(uint8_t *buffer, struct rng_state *rng);
+int      build_packet_igmp(uint8_t *buffer, struct rng_state *rng);
 void    *worker_func(void *arg);
 void    *pcap_replay_func(void *arg);
 void    *sweep_thread_func(void *arg);

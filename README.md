@@ -1,4 +1,4 @@
-# Basidium v2.2
+# Basidium v2.3
 
 **Multi-threaded Layer-2 Stress & Hardware Evaluation Tool**
 <img width="709" height="497" alt="Basidium Screenshot" src="https://github.com/user-attachments/assets/1fe90db9-669f-4a5e-9c48-4ea22cd53733" />
@@ -41,10 +41,12 @@ graph TD
     CLI --> SNIFF[sniffer_thread<br/>learning / adaptive<br/>fail-open detection]
     FLOOD --> PCAP[libpcap<br/>pcap_inject]
     TUI --> NCCL[nccl.c<br/>NCCL subprocess]
-    TUI --> NIC[nic_stats.c<br/>/sys/class/net]
+    TUI --> NIC[nic_stats.c<br/>Linux: /sys/class/net<br/>macOS: getifaddrs]
     CLI --> REPORT[report.c<br/>JSON report]
     CLI --> PROFILES[profiles.c<br/>~/.basidium/]
 ```
+
+### Flood Modes & Packet Path
 
 ```mermaid
 graph LR
@@ -61,13 +63,32 @@ graph LR
 
     subgraph "Worker Thread"
         FP[Fast path<br/>Xorshift128+<br/>direct MAC write]
-        SP[Slow path<br/>full packet rebuild]
+        SP[Slow path<br/>per-thread RNG<br/>full packet rebuild]
     end
 
     M0 -->|no stealth/VLAN-range| FP
     M0 -->|stealth/learning/VLAN| SP
     M1 & M2 & M3 & M4 & M5 & M6 & M7 --> SP
 ```
+
+### Thread-Safe RNG Architecture
+
+```mermaid
+graph TD
+    MAIN[main thread<br/>seeds probe_signature] --> W0[Worker 0<br/>rng_init seed=0]
+    MAIN --> W1[Worker 1<br/>rng_init seed=1]
+    MAIN --> WN[Worker N<br/>rng_init seed=N]
+
+    W0 --> RNG0[xorshift128+<br/>thread-local state]
+    W1 --> RNG1[xorshift128+<br/>thread-local state]
+    WN --> RNGN[xorshift128+<br/>thread-local state]
+
+    RNG0 --> B0[build_packet_*<br/>rng_rand for MACs,IPs]
+    RNG1 --> B1[build_packet_*<br/>rng_rand for MACs,IPs]
+    RNGN --> BN[build_packet_*<br/>rng_rand for MACs,IPs]
+```
+
+### TUI Launch Sequence
 
 ```mermaid
 sequenceDiagram
@@ -80,6 +101,7 @@ sequenceDiagram
     User->>TUI: launch --tui
     TUI->>Workers: spawn (standby)
     TUI->>Sniffer: spawn (if learning/detect)
+    Sniffer->>Sniffer: install BPF filter
     User->>TUI: press s (start)
     TUI->>Workers: set is_started=1
     loop inject
@@ -89,6 +111,33 @@ sequenceDiagram
     end
     User->>TUI: press q
     TUI->>Workers: set is_running=0
+```
+
+### Where Basidium Fits in a GPU Cluster
+
+```mermaid
+graph TB
+    subgraph "GPU Training Cluster"
+        GPU1[GPU Server 1<br/>ConnectX-7 100GbE]
+        GPU2[GPU Server 2<br/>ConnectX-7 100GbE]
+        GPU3[GPU Server 3<br/>ConnectX-7 100GbE]
+        GPU4[GPU Server 4<br/>ConnectX-7 100GbE]
+    end
+
+    subgraph "Fabric"
+        TOR1[ToR Switch 1<br/>Lossless Ethernet<br/>PFC + ECN]
+        TOR2[ToR Switch 2<br/>Lossless Ethernet<br/>PFC + ECN]
+        SPINE[Spine Switch]
+    end
+
+    GPU1 & GPU2 --> TOR1
+    GPU3 & GPU4 --> TOR2
+    TOR1 & TOR2 --> SPINE
+
+    BASIDIUM[Basidium<br/>Mgmt Host] -->|inject PFC/MAC/ARP/STP| TOR1
+
+    style BASIDIUM fill:#2d6,stroke:#000,color:#fff
+    style TOR1 fill:#f96,stroke:#000
 ```
 
 ---
@@ -113,14 +162,15 @@ sudo make install
 # Custom prefix
 sudo make install PREFIX=/opt/local
 
-# Self-test (11 packet builder tests)
+# Self-test (12 packet builder tests)
 sudo make selftest
 ```
 
 **Platform notes:**
 - Linux: fully supported; NIC TX/RX statistics read from `/sys/class/net/`
-- macOS: CLI and TUI build and run correctly; NIC statistics panel shows `n/a` (no `/sys/class/net` equivalent)
-- Raw packet injection requires root (`sudo`) on both platforms
+- macOS: fully supported; NIC statistics read via `getifaddrs()` + `AF_LINK` `if_data`
+- FreeBSD / OpenBSD / NetBSD: NIC statistics supported via same BSD `getifaddrs()` path
+- Raw packet injection requires root (`sudo`) on all platforms
 
 ---
 
@@ -159,6 +209,9 @@ sudo ./basidium -i eth0 -V 10 --vlan-range 20 -t 4
 
 # Fail-open detection + adaptive throttle
 sudo ./basidium -i eth0 --detect -A
+
+# Version
+./basidium --version
 ```
 
 ---
@@ -247,7 +300,9 @@ Ramps injection rate from `start` to `end` PPS in `step` increments, holding eac
 ### Diagnostics
 | Flag | Description |
 |------|-------------|
-| `--selftest` | Run 11 built-in validation tests |
+| `--selftest` | Run 12 built-in validation tests |
+| `--version` | Print version and exit |
+| `--dry-run` | Build & count packets without injecting (no sudo needed) |
 
 ---
 
@@ -473,6 +528,18 @@ Default priority 3 is the standard lossless class on Mellanox/NVIDIA ConnectX an
 sudo ./basidium -i eth0 -M pfc -V 100 --pfc-priority 3 --pfc-quanta 65535
 ```
 
+### Note on Apple RDMA over Thunderbolt 5
+
+macOS 26.2 introduced native RDMA over Thunderbolt 5 with an `ibverbs`-compatible API (`infiniband/verbs.h`, `librdma.tbd`). This is a fundamentally different transport from the RoCE/InfiniBand-over-Ethernet fabrics that Basidium targets:
+
+| | GPU Cluster Fabric (Basidium) | Apple TB5 RDMA |
+|---|---|---|
+| **Transport** | Ethernet (RoCEv2) | Thunderbolt 5 protocol |
+| **Flow control** | PFC PAUSE (IEEE 802.1Qbb) | Credit-based (TB controller HW) |
+| **Topology** | Multi-hop switched fabric | Point-to-point, no switch |
+
+Basidium's `-M pfc` mode generates IEEE 802.1Qbb MAC Control frames (`EtherType 0x8808`) that stress-test Ethernet switch priority queues. A Thunderbolt 5 controller does not process these frames — it uses credit-based flow control at the hardware level. The failure modes that matter for TB5 RDMA (QP exhaustion, PD leaks, credit stalls) are verbs-level application concerns, not Layer-2 fabric issues.
+
 ---
 
 ## QinQ Double-Tagging
@@ -493,7 +560,7 @@ sudo ./basidium -i eth0 -V 100 --qinq 200 -t 4
 
 ## Named Profiles
 
-Profiles are stored in `~/.basidium/` as key=value files. All fields — VLAN, PFC, sweep, burst, detect, QinQ, payload, threads, rate — are persisted.
+Profiles are stored in `~/.basidium/` as key=value files. All fields — VLAN, PFC, sweep, burst, detect, QinQ, payload, threads, rate — are persisted. Profile names are restricted to alphanumeric characters, dashes, and underscores to prevent path traversal.
 
 ```sh
 # Save from TUI: press p → s → type name → Enter
@@ -508,29 +575,33 @@ sudo ./basidium --profile stp-flood
 ## Source Layout
 
 ```
-basidium.c      main(), CLI parsing, thread orchestration
+basidium.c      main(), CLI parsing, thread orchestration, SIGINT/SIGTERM
 flood.c         packet builders, worker threads, sniffer, RNG, selftest
+flood.h         shared types, flood_mode_t enum, config struct, prototypes
 tui.c           ncurses TUI (make TUI=1)
 nccl.c/.h       NCCL subprocess orchestration
-profiles.c/.h   named profile save/load (~/.basidium/)
-nic_stats.c/.h  NIC statistics (/sys/class/net/)
+profiles.c/.h   named profile save/load (~/.basidium/) with name sanitization
+nic_stats.c/.h  NIC statistics (Linux: sysfs, macOS/BSD: getifaddrs)
 report.c/.h     JSON session report writer
-flood.h         shared types, config struct, extern globals, prototypes
 ```
 
 ### Fast Path
 
 In MAC flood mode without stealth, learning, or VLAN-range active, workers use Xorshift128+ to overwrite only the 12 MAC bytes of a pre-built frame template — no packet-builder overhead, near wire-rate throughput.
 
+### Thread Safety
+
+All packet builders accept a per-thread `struct rng_state *` parameter. No global `rand()` calls occur in worker threads. Each thread initializes its own xorshift128+ state from a unique seed, ensuring deterministic, lock-free random number generation.
+
 ---
 
 ## Dependencies
 
-| Library | Debian/Ubuntu | RHEL/Fedora |
-|---------|--------------|-------------|
-| libpcap | `libpcap-dev` | `libpcap-devel` |
-| libpthread | standard | standard |
-| libncurses | `libncurses-dev` | `ncurses-devel` (TUI only) |
+| Library | Debian/Ubuntu | RHEL/Fedora | macOS (Homebrew) |
+|---------|--------------|-------------|-----------------|
+| libpcap | `libpcap-dev` | `libpcap-devel` | `brew install libpcap` (usually preinstalled) |
+| libpthread | standard | standard | standard |
+| libncurses | `libncurses-dev` | `ncurses-devel` (TUI only) | preinstalled |
 
 ---
 
