@@ -1,0 +1,8 @@
+# PFC stress ramp — test NCCL degradation under increasing PFC pressure
+# Format: mode pps duration [nccl]
+
+mac   1000  10  nccl
+pfc   5000  10  nccl
+pfc  20000  10  nccl
+pfc  50000  10  nccl
+mac   1000  10  nccl

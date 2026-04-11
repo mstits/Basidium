@@ -6,7 +6,7 @@ VERSION = 2.3
 CFLAGS += -DBASIDIUM_VERSION=\"$(VERSION)\"
 
 TARGET  = basidium
-SRC     = basidium.c flood.c nccl.c profiles.c nic_stats.c report.c
+SRC     = basidium.c flood.c nccl.c tco.c profiles.c nic_stats.c report.c
 
 # Build with ncurses TUI: make TUI=1
 TUI ?= 0
@@ -29,6 +29,7 @@ check: $(TARGET)
 	./$(TARGET) --dry-run -M arp -n 100
 	./$(TARGET) --dry-run -M pfc -n 100
 	./$(TARGET) --dry-run -M igmp -n 100
+	./$(TARGET) --dry-run --scenario examples/ci-smoke.tco
 	@echo "All checks passed."
 
 debug: CFLAGS := -Wall -Wextra -g -DDEBUG -O0 -DBASIDIUM_VERSION=\"$(VERSION)\"

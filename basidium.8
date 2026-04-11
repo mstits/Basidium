@@ -145,6 +145,24 @@ PPS in
 increments, holding each for
 .I hold_s
 seconds (default 10). Exits on completion.
+.PP
+When combined with
+.BR \-\-nccl ,
+an NCCL test is launched at each step and the sweep waits for
+its completion before advancing. The JSON report includes per-step
+.B nccl_busbw
+and
+.B nccl_degradation_pct.
+.SS "TCO (Targeted Congestion Orchestration)"
+.TP
+.BI \-\-scenario " file"
+Run a multi-step congestion scenario from a
+.I .tco
+file. Each line defines a step:
+.IR "mode  pps  duration_s  [nccl]" .
+Workers dynamically switch modes at runtime.
+Mutually exclusive with
+.BR \-\-sweep .
 .SS "Output & Logging"
 .TP
 .B \-v
@@ -173,7 +191,14 @@ onto the interface.
 .SS "NCCL Correlation"
 .TP
 .B \-\-nccl
-Enable NCCL correlation panel in TUI.
+Enable NCCL busbw correlation. In TUI mode, shows a live NCCL panel.
+With
+.BR \-\-sweep ,
+auto-measures busbw at each PPS step.
+With
+.BR \-\-scenario ,
+measures busbw at each scenario step marked with
+.BR nccl .
 .TP
 .BI \-\-nccl-binary " path"
 Path to nccl-tests binary (implies
@@ -249,10 +274,27 @@ Fail-open detection with adaptive throttle:
 .RS
 .B sudo basidium -i eth0 --detect -A
 .RE
+.PP
+NCCL-correlated sweep:
+.RS
+.B sudo basidium -i eth0 --sweep 1000:50000:5000:30 --nccl --report
+.RE
+.PP
+TCO scenario with NCCL correlation:
+.RS
+.B sudo basidium -i eth0 --scenario fabric-test.tco --nccl --report
+.RE
 .SH FILES
 .TP
 .I ~/.basidium/*.conf
 Named configuration profiles.
+.TP
+.I *.tco
+TCO scenario files. Plain-text, one step per line:
+.IR "mode  pps  duration_s  [nccl]" .
+Lines beginning with
+.B #
+are comments.
 .TP
 .I basidium-YYYYMMDD-HHMMSS.json
 Auto-generated session report.

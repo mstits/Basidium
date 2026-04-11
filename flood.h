@@ -12,6 +12,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <time.h>
+#include "nic_stats.h"
 
 /* ---- compile-time limits ---- */
 #define MAX_PACKET_SIZE    9216
@@ -175,6 +176,7 @@ struct config {
     int      qinq_outer_vid;    /* --qinq: 802.1ad outer VLAN ID (0=disabled, 1-4094) */
     int      payload_pattern;  /* --payload: 0=zeros(default), 1=ff, 2=dead, 3=incr */
     int      dry_run;          /* --dry-run: build & count packets without injecting */
+    char    *scenario_file;    /* --scenario: TCO scenario file path */
 };
 
 /* ---- shared state (defined in basidium.c) ---- */
@@ -201,6 +203,10 @@ extern time_t            start_time;
 
 #define MAX_SWEEP_STEPS 128
 extern unsigned long long sweep_step_pps[MAX_SWEEP_STEPS]; /* achieved PPS per step */
+extern double             sweep_step_nccl_busbw[MAX_SWEEP_STEPS]; /* NCCL busbw per step */
+extern int                sweep_step_nccl_valid[MAX_SWEEP_STEPS]; /* 1 if busbw was measured */
+extern struct nic_stats   sweep_step_nic_delta[MAX_SWEEP_STEPS]; /* NIC counter delta per step */
+extern int                sweep_step_nic_valid[MAX_SWEEP_STEPS]; /* 1 if nic delta was computed */
 
 /* ---- flood.c prototypes ---- */
 void     log_event(const char *type, const char *msg);

@@ -14,6 +14,7 @@
 #define _GNU_SOURCE
 #include "flood.h"
 #include "nccl.h"
+#include "tco.h"
 #include "profiles.h"
 #include "nic_stats.h"
 #include "report.h"
@@ -49,6 +50,10 @@ atomic_int        sweep_step_num       = 0;
 atomic_int        sweep_total_steps    = 0;
 atomic_int        sweep_hold_rem       = 0;
 unsigned long long sweep_step_pps[MAX_SWEEP_STEPS];
+double             sweep_step_nccl_busbw[MAX_SWEEP_STEPS];
+int                sweep_step_nccl_valid[MAX_SWEEP_STEPS];
+struct nic_stats   sweep_step_nic_delta[MAX_SWEEP_STEPS];
+int                sweep_step_nic_valid[MAX_SWEEP_STEPS];
 atomic_ullong     thread_sent[MAX_THREADS];
 atomic_ullong     bcast_rx        = 0;
 uint16_t          probe_signature = 0;
@@ -119,14 +124,21 @@ static void usage(void) {
     printf("  --sweep <start:end:step[:hold_s]>  Ramp rate from start to end pps\n");
     printf("                                     step    increment per stage (pps)\n");
     printf("                                     hold_s  seconds per stage (default: 10)\n");
+    printf("  With --nccl: auto-measures NCCL busbw at each step for correlation.\n");
     printf("  Tip: pair --sweep with --report to produce a full benchmark JSON report.\n\n");
+
+    printf("\033[1mTCO (TARGETED CONGESTION ORCHESTRATION):\033[0m\n");
+    printf("  --scenario <file.tco>  Run a multi-step congestion scenario\n");
+    printf("                         Each line: mode  pps  duration_s  [nccl]\n");
+    printf("                         Switches modes at runtime across workers.\n");
+    printf("                         Mutually exclusive with --sweep.\n\n");
 
     printf("\033[1mNETWORK I/O:\033[0m\n");
     printf("  --pcap-out <file>     Write packets to .pcap instead of live inject\n");
     printf("  --pcap-replay <file>  Replay .pcap frames onto the interface\n\n");
 
     printf("\033[1mNCCL CORRELATION:\033[0m\n");
-    printf("  --nccl                Enable NCCL correlation panel in TUI\n");
+    printf("  --nccl                Enable NCCL busbw correlation (TUI + sweep + scenario)\n");
     printf("  --nccl-binary <path>  Path to nccl-tests binary (implies --nccl)\n\n");
 
     printf("\033[1mPROFILES & SESSIONS:\033[0m\n");
@@ -150,6 +162,8 @@ static void usage(void) {
     printf("  sudo ./basidium -i eth0 --pcap-replay capture.pcap\n");
     printf("  sudo ./basidium -i eth0 -V 10 --vlan-range 20 -t 4\n");
     printf("  sudo ./basidium -i eth0 --sweep 1000:50000:5000:10 --report\n");
+    printf("  sudo ./basidium -i eth0 --sweep 1000:50000:5000:30 --nccl --report\n");
+    printf("  sudo ./basidium -i eth0 --scenario scenario.tco --nccl --report\n");
     printf("  sudo ./basidium -i eth0 --detect -A\n");
     printf("  sudo ./basidium -i eth0 --burst 64:100\n\n");
 
@@ -193,6 +207,7 @@ int main(int argc, char **argv) {
         {"payload",      required_argument, 0, 0},
         {"version",      no_argument,       0, 0},
         {"dry-run",      no_argument,       0, 0},
+        {"scenario",     required_argument, 0, 0},
         {0, 0, 0, 0}
     };
 
@@ -260,6 +275,9 @@ int main(int argc, char **argv) {
                 if      (*end == 'm') val *= 60;
                 else if (*end == 'h') val *= 3600;
                 conf.session_duration = val;
+            }
+            if (strcmp(name, "scenario")    == 0) {
+                conf.scenario_file = strdup(optarg);
             }
             continue;
         }
@@ -376,14 +394,33 @@ int main(int argc, char **argv) {
     /* Rate sweep thread */
     pthread_t sweep_th;
     int sweep_running = 0;
-    if (conf.sweep_enabled) {
+    if (conf.sweep_enabled && !conf.scenario_file) {
         conf.pps = conf.sweep_start;
         pthread_create(&sweep_th, NULL, sweep_thread_func, NULL);
         sweep_running = 1;
         if (!conf.tui)
-            printf("Sweep: %d→%d pps, step %d, hold %ds\n",
+            printf("Sweep: %d→%d pps, step %d, hold %ds%s\n",
                    conf.sweep_start, conf.sweep_end,
-                   conf.sweep_step, conf.sweep_hold);
+                   conf.sweep_step, conf.sweep_hold,
+                   conf.nccl ? " [NCCL correlation active]" : "");
+    }
+
+    /* TCO scenario thread (mutually exclusive with sweep) */
+    pthread_t tco_th;
+    int tco_running = 0;
+    if (conf.scenario_file) {
+        if (conf.sweep_enabled) {
+            fprintf(stderr, "Error: --scenario and --sweep are mutually exclusive\n");
+            exit(1);
+        }
+        if (tco_load(conf.scenario_file) != 0)
+            exit(1);
+        pthread_create(&tco_th, NULL, tco_thread_func, NULL);
+        tco_running = 1;
+        if (!conf.tui)
+            printf("TCO scenario: %s (%d steps)%s\n",
+                   tco_scenario.name, tco_scenario.step_count,
+                   conf.nccl ? " [NCCL correlation active]" : "");
     }
 
     /* PCAP replay mode */
@@ -478,6 +515,9 @@ int main(int argc, char **argv) {
     if (sweep_running)
         pthread_join(sweep_th, NULL);
 
+    if (tco_running)
+        pthread_join(tco_th, NULL);
+
     if (global_pd) pcap_dump_close(global_pd);
 
     log_event("STOP", "Stress test finished");
@@ -486,7 +526,7 @@ int main(int argc, char **argv) {
            (unsigned long long)peak_pps);
 
     /* session report */
-    if (conf.report_path || conf.sweep_enabled || conf.nccl) {
+    if (conf.report_path || conf.sweep_enabled || conf.nccl || conf.scenario_file) {
         struct nic_stats final_nic;
         int have_nic = (nic_stats_read(conf.interface, &final_nic) == 0);
         write_report(conf.report_path, have_nic ? &final_nic : NULL);

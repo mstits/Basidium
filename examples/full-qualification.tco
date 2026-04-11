@@ -1,0 +1,31 @@
+# Full Fabric Qualification
+#
+# End-to-end switch qualification scenario.  Exercises all major flood
+# modes with NCCL correlation at each step.  Designed for initial
+# bring-up of spine-leaf fabric nodes in GPU clusters.
+#
+# Test sequence:
+#   1. Baseline NCCL measurement under idle fabric
+#   2. MAC flood — CAM table stress
+#   3. PFC flood — lossless Ethernet / RoCE queue stress
+#   4. ARP flood — ARP/ND table resource limits
+#   5. STP flood — spanning-tree convergence and MAC flush
+#   6. IGMP flood — multicast snooping table exhaustion
+#   7. LLDP flood — switch CPU / control-plane stress
+#   8. Recovery — verify fabric returns to baseline
+#
+# Run with:
+#   sudo ./basidium -i eth0 --scenario examples/full-qualification.tco \
+#        --nccl --report -t 4
+#
+# Total runtime: ~7.5 minutes
+# Format: mode  pps  duration_s  [nccl]
+
+mac    1000   30  nccl    # 1. baseline — idle fabric NCCL reference
+mac   20000   60  nccl    # 2. MAC flood — CAM table stress
+pfc   20000   60  nccl    # 3. PFC flood — lossless queue stress
+arp   10000   60  nccl    # 4. ARP flood — ARP table limits
+stp    5000   60  nccl    # 5. STP TCN  — forced MAC table flush
+igmp  10000   60  nccl    # 6. IGMP     — snooping table exhaustion
+lldp   5000   60  nccl    # 7. LLDP     — control-plane CPU stress
+mac    1000   60  nccl    # 8. Recovery — verify return to baseline

@@ -1,0 +1,22 @@
+# PFC Watchdog Validation
+#
+# Tests whether the switch's PFC watchdog timer correctly detects and
+# breaks a sustained PFC storm.  A properly configured watchdog will
+# disable the port or drop PFC frames after the storm threshold, and
+# traffic should resume during the release window.
+#
+# Expected switch behavior:
+#   Steps 1-2: PFC watchdog should trigger (sustained storm > threshold)
+#   Step 3:    Traffic should resume; verify port is re-enabled
+#   Steps 4-5: Second storm; verify watchdog fires again
+#   Step 6:    Final recovery; confirm port health
+#
+# Pair with SNMP polling of PFC watchdog counters and syslog monitoring.
+# Format: mode  pps  duration_s  [nccl]
+
+mac    1000   10  nccl    # baseline — light traffic + NCCL reference
+pfc   50000   30  nccl    # storm phase 1 — sustained PFC flood
+mac    1000   15  nccl    # release window — verify recovery
+pfc   50000   30  nccl    # storm phase 2 — verify watchdog fires again
+mac    1000   15  nccl    # release window — verify port re-enabled
+mac    1000   10  nccl    # final baseline — compare to initial

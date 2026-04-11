@@ -1,30 +1,66 @@
-# Basidium v2.3
+# Basidium
 
-**Multi-threaded Layer-2 Stress & Hardware Evaluation Tool**
+**Multi-threaded Layer-2 Stress & Hardware Evaluation Tool for GPU Cluster Fabrics**
+
 <img width="709" height="497" alt="Basidium Screenshot" src="https://github.com/user-attachments/assets/1fe90db9-669f-4a5e-9c48-4ea22cd53733" />
 
 [![Build](https://github.com/mstits/Basidium/actions/workflows/build.yml/badge.svg)](https://github.com/mstits/Basidium/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+---
+
 ## Why This Exists
 
-Modern AI training and inference infrastructure depends on large GPU clusters interconnected by high-speed fabrics — typically RoCE or InfiniBand over 100/400 GbE. Collective communication libraries such as NCCL make heavy, continuous use of these fabrics during training: `allreduce`, `allgather`, `broadcast`, and related operations generate substantial traffic across multiple switch hops, with the exact pattern depending on the collective algorithm and topology in use.
+Modern AI training and inference infrastructure depends on large GPU clusters interconnected by high-speed fabrics — typically RoCE or InfiniBand over 100/400/800 GbE. Collective communication libraries such as NCCL make heavy, continuous use of these fabrics: `allreduce`, `allgather`, `broadcast`, and related operations generate substantial traffic across multiple switch hops.
 
-In this environment, a single misbehaving switch, a misconfigured NIC, or a fabric policy error does not necessarily cause an obvious outage. Instead it can manifest as silent performance degradation — NCCL throughput drops, step times increase, and GPU utilization falls. These symptoms are often subtle and slow to develop, making root cause identification genuinely difficult.
+In this environment, a single misbehaving switch, a misconfigured NIC, or a fabric policy error does not necessarily cause an obvious outage. Instead, it can manifest as **silent performance degradation** — NCCL throughput drops, step times increase, and GPU utilization falls. These symptoms are often subtle and slow to develop, making root cause identification genuinely difficult.
 
 This problem is not limited to initial bring-up. GPU cluster fabrics are complex systems whose behavior can drift over time: firmware updates, configuration changes, physical layer degradation, and incremental topology changes can all introduce regressions that were not present at initial qualification. Periodic re-validation is a practical necessity, not a one-time exercise.
 
-Basidium exists to stress-test and validate this hardware at bring-up and throughout its operational life. It can:
+Standard network qualification (like RFC 2544) does not exercise the fabric at the intensity needed for dense GPU clusters. Basidium provides the high-fidelity stress required to surface the failure modes that cause multi-million dollar idle-time in AI training.
 
-- Saturate CAM tables to verify switch fail-open behavior and VLAN isolation under load
-- Flood PFC PAUSE frames to confirm RoCE/RDMA priority flow control is correctly configured and does not deadlock under congestion — a known failure mode in lossless Ethernet fabrics
-- Exhaust IGMP snooping and ARP tables to find resource limits before they surface in production
-- Generate precise rate sweeps with JSON reporting to establish forwarding capacity baselines and detect regressions over time
-- Run alongside NCCL collective tests to observe whether Layer-2 stress conditions measurably affect application-layer throughput — providing a side-by-side view that helps isolate whether a performance problem originates in the fabric
+### The Pedestal
 
-These are not theoretical failure modes. They are well-documented causes of degraded performance in dense GPU clusters that standard network qualification testing does not always exercise at the scale or intensity needed to surface them.
+A *basidium* (from the Latin, meaning "little pedestal") is the structural foundation that supports and launches spores into the environment. While the mushroom's cap gets the attention, the basidium is the microscopic machinery that ensures the next generation actually takes flight.
 
-> **Authorization required.** Use only on airgapped hardware you own or have explicit written permission to test. Never run against production infrastructure or equipment belonging to others.
+sIn a GPU cluster, **the network fabric is the basidium**. The models get the headlines, but they cannot exist without a stable pedestal. If the fabric is cracked, jittery, or misconfigured, the entire computational process fails, sometimes silently, sometimes catastrophically and sometimes its just a pain in the ass to debug with ATAC. Basidium ensures the pedestal doesn't buckle under the weight of line-rate traffic before you risk your training budget.
+
+### Core Capabilities
+
+```mermaid
+graph LR
+    subgraph "Layer-2 Stress"
+        PFC["PFC PAUSE Flood<br/>RoCE/RDMA deadlock testing"]
+        CAM["CAM Table Exhaustion<br/>fail-open detection"]
+        ARP["ARP / ND / IGMP<br/>table resource limits"]
+        STP["STP TCN Flood<br/>forced MAC flush"]
+    end
+
+    subgraph "Measurement"
+        SWEEP["Rate Sweep<br/>PPS ramp + JSON report"]
+        NCCL["NCCL Correlation<br/>per-step busbw + degradation%"]
+    end
+
+    subgraph "Orchestration"
+        TCO["TCO Scenarios<br/>multi-mode congestion patterns<br/>.tco scenario files"]
+    end
+
+    PFC & CAM & ARP & STP --> SWEEP
+    SWEEP --> NCCL
+    TCO --> |"mode + PPS<br/>per step"| PFC & CAM & ARP & STP
+    TCO --> NCCL
+```
+
+- **PFC / RDMA Stress:** Flood PFC PAUSE frames to confirm RoCE/RDMA priority flow control is correctly configured and does not deadlock under congestion — a known failure mode in lossless Ethernet fabrics.
+- **L2 Table Exhaustion:** Saturate CAM tables to verify switch fail-open behavior and VLAN isolation under load. Exhaust IGMP snooping and ARP tables to find resource limits before they surface in production.
+- **Rate Sweeps:** Generate precise rate sweeps with JSON reporting to establish forwarding capacity baselines and detect regressions over time.
+- **NCCL Co-Validation:** Run injection patterns simultaneously with NCCL collective tests to observe how Layer-2 stress conditions measurably affect application-layer throughput. This side-by-side view helps isolate whether a performance problem originates in the fabric or the software stack.
+- **Targeted Congestion Orchestration (TCO):** Define multi-step, multi-mode congestion scenarios (`.tco` files) that switch between flood modes at runtime while measuring NCCL degradation at each step.
+- **Regression Detection:** Identify performance drift caused by firmware updates, configuration changes, physical layer degradation, or incremental topology changes.
+
+> **⚠️ Authorization required.** Use only on airgapped hardware you own or have explicit written permission to test. Never run against production infrastructure or equipment belonging to others.
+>
+> **Total Cluster Outage (TCO) Warning:** Many modules in this tool — specifically PFC flooding and TCO orchestration — are designed to halt traffic flow. Using these on a live environment will likely trigger a **Total Cluster Outage**. Periodic re-validation is a practical necessity, but it must be conducted in a controlled, isolated environment.
 
 **Author:** Matthew Stits \<stits@stits.org\>  
 **Repository:** https://github.com/mstits/Basidium
@@ -35,15 +71,19 @@ These are not theoretical failure modes. They are well-documented causes of degr
 
 ```mermaid
 graph TD
-    CLI[basidium.c<br/>CLI / main loop] --> FLOOD[flood.c<br/>packet builders<br/>worker threads]
-    CLI --> TUI[tui.c<br/>ncurses TUI]
-    CLI --> SWEEP[sweep_thread<br/>rate ramp]
-    CLI --> SNIFF[sniffer_thread<br/>learning / adaptive<br/>fail-open detection]
-    FLOOD --> PCAP[libpcap<br/>pcap_inject]
-    TUI --> NCCL[nccl.c<br/>NCCL subprocess]
-    TUI --> NIC[nic_stats.c<br/>Linux: /sys/class/net<br/>macOS: getifaddrs]
-    CLI --> REPORT[report.c<br/>JSON report]
-    CLI --> PROFILES[profiles.c<br/>~/.basidium/]
+    CLI["basidium.c<br/>CLI / main loop"] --> FLOOD["flood.c<br/>packet builders<br/>worker threads"]
+    CLI --> TUI["tui.c<br/>ncurses TUI"]
+    CLI --> SWEEP["sweep_thread<br/>rate ramp"]
+    CLI --> TCO["tco.c<br/>scenario orchestrator"]
+    CLI --> SNIFF["sniffer_thread<br/>learning / adaptive<br/>fail-open detection"]
+    FLOOD --> PCAP["libpcap<br/>pcap_inject"]
+    TCO --> |"mutates conf.mode<br/>+ conf.pps"| FLOOD
+    SWEEP --> |"mutates conf.pps<br/>+ launches NCCL"| NCCL
+    TCO --> |"launches NCCL<br/>per step"| NCCL["nccl.c<br/>NCCL subprocess"]
+    TUI --> NCCL
+    TUI --> NIC["nic_stats.c<br/>Linux: /sys/class/net<br/>macOS: getifaddrs"]
+    CLI --> REPORT["report.c<br/>JSON report"]
+    CLI --> PROFILES["profiles.c<br/>~/.basidium/"]
 ```
 
 ### Flood Modes & Packet Path
@@ -118,26 +158,38 @@ sequenceDiagram
 ```mermaid
 graph TB
     subgraph "GPU Training Cluster"
-        GPU1[GPU Server 1<br/>ConnectX-7 100GbE]
-        GPU2[GPU Server 2<br/>ConnectX-7 100GbE]
-        GPU3[GPU Server 3<br/>ConnectX-7 100GbE]
-        GPU4[GPU Server 4<br/>ConnectX-7 100GbE]
+        GPU1["GPU Server 1<br/>ConnectX-7 100GbE"]
+        GPU2["GPU Server 2<br/>ConnectX-7 100GbE"]
+        GPU3["GPU Server 3<br/>ConnectX-7 100GbE"]
+        GPU4["GPU Server 4<br/>ConnectX-7 100GbE"]
     end
 
     subgraph "Fabric"
-        TOR1[ToR Switch 1<br/>Lossless Ethernet<br/>PFC + ECN]
-        TOR2[ToR Switch 2<br/>Lossless Ethernet<br/>PFC + ECN]
-        SPINE[Spine Switch]
+        TOR1["ToR Switch 1<br/>Lossless Ethernet<br/>PFC + ECN"]
+        TOR2["ToR Switch 2<br/>Lossless Ethernet<br/>PFC + ECN"]
+        SPINE["Spine Switch"]
     end
 
     GPU1 & GPU2 --> TOR1
     GPU3 & GPU4 --> TOR2
     TOR1 & TOR2 --> SPINE
 
-    BASIDIUM[Basidium<br/>Mgmt Host] -->|inject PFC/MAC/ARP/STP| TOR1
+    subgraph "Basidium Host"
+        B["Basidium"]
+        TCO_F[".tco scenario"]
+        NCCL_T["NCCL test"]
+        REPORT_F["JSON report"]
+    end
 
-    style BASIDIUM fill:#2d6,stroke:#000,color:#fff
+    TCO_F --> |"defines steps"| B
+    B --> |"inject PFC/MAC/ARP/STP"| TOR1
+    B --> |"launches per step"| NCCL_T
+    NCCL_T --> |"allreduce via fabric"| TOR1
+    B --> REPORT_F
+
+    style B fill:#2d6,stroke:#000,color:#fff
     style TOR1 fill:#f96,stroke:#000
+    style TCO_F fill:#369,stroke:#000,color:#fff
 ```
 
 ---
@@ -177,42 +229,29 @@ sudo make selftest
 ## Quick Start
 
 ```sh
-# MAC CAM flood, 4 threads
-sudo ./basidium -i eth0 -t 4
+# ---- Build ----
+make TUI=1                    # compile with ncurses TUI
 
-# ARP broadcast storm at 5000 pps with TUI
-sudo ./basidium -i eth0 -M arp -r 5000 --tui
+# ---- Basic Stress ----
+sudo ./basidium -i eth0 -t 4                         # MAC CAM flood, 4 threads
+sudo ./basidium -i eth0 -M arp -r 5000 --tui         # ARP storm at 5000 pps with TUI
+sudo ./basidium -i eth0 -M pfc                       # PFC PAUSE flood on RDMA priority 3
+sudo ./basidium -i eth0 -M igmp -t 4                 # IGMP snooping exhaustion
 
-# PFC PAUSE flood on RDMA priority 3
-sudo ./basidium -i eth0 -M pfc
+# ---- Rate Sweep + NCCL Correlation ----
+sudo ./basidium -i eth0 --sweep 1000:50000:5000:30 --nccl --report
 
-# IGMP snooping exhaustion
-sudo ./basidium -i eth0 -M igmp -t 4
+# ---- TCO Scenario ----
+sudo ./basidium -i eth0 --scenario pfc-ramp.tco --nccl --report
 
-# STP TCN BPDU flood (forces MAC table flush)
-sudo ./basidium -i eth0 -M stp
+# ---- Fail-Open Detection ----
+sudo ./basidium -i eth0 --detect -A --tui
 
-# IPv6 ND flood
-sudo ./basidium -i eth0 -M nd -t 2
-
-# QinQ double-tagging: outer VID 200, inner VID 100
-sudo ./basidium -i eth0 -V 100 --qinq 200 -t 4
-
-# Sweep 1k->50k pps, 5k steps, 10s hold, write report
-sudo ./basidium -i eth0 --sweep 1000:50000:5000:10 --report
-
-# Burst mode: 64-frame bursts with 100 ms gaps
-sudo ./basidium -i eth0 --burst 64:100
-
-# Flood VLANs 10-20 randomly
-sudo ./basidium -i eth0 -V 10 --vlan-range 20 -t 4
-
-# Fail-open detection + adaptive throttle
-sudo ./basidium -i eth0 --detect -A
-
-# Version
-./basidium --version
+# ---- Dry Run (no sudo, no NIC) ----
+./basidium --dry-run -M pfc -n 1000
 ```
+
+*Build your models on a solid pedestal. Build on Basidium.*
 
 ---
 
@@ -288,8 +327,13 @@ Ramps injection rate from `start` to `end` PPS in `step` increments, holding eac
 ### NCCL Correlation
 | Flag | Description |
 |------|-------------|
-| `--nccl` | NCCL busbw correlation panel in TUI |
+| `--nccl` | NCCL busbw correlation panel in TUI; per-step measurement during `--sweep` and `--scenario` |
 | `--nccl-binary <path>` | Path to nccl-tests binary (implies `--nccl`) |
+
+### TCO (Targeted Congestion Orchestration)
+| Flag | Description |
+|------|-------------|
+| `--scenario <file>` | Run a multi-step congestion scenario from a `.tco` file (mutually exclusive with `--sweep`) |
 
 ### Profiles & Sessions
 | Flag | Description |
@@ -480,32 +524,117 @@ sudo ./basidium -i eth0 --detect -A --tui
 ```mermaid
 flowchart LR
     A[sweep_start PPS] -->|+sweep_step| B[inject for sweep_hold s]
-    B --> C{reached sweep_end?}
+    B --> N{--nccl?}
+    N -->|yes| F[launch NCCL test]
+    F --> G[wait for NCCL completion]
+    G --> H[record PPS + busbw]
+    N -->|no| E[record achieved PPS]
+    E --> C{reached sweep_end?}
+    H --> C
     C -->|no| A
-    C -->|yes| D[write JSON report<br/>exit]
-    B --> E[record achieved PPS]
-    E --> B
+    C -->|yes| D["write JSON report<br/>exit"]
 ```
 
 ```sh
+# Standard sweep (no NCCL)
 sudo ./basidium -i eth0 --sweep 1000:100000:10000:5 --report /tmp/report.json
+
+# NCCL-correlated sweep — measures busbw at each congestion level
+sudo ./basidium -i eth0 -M pfc --sweep 1000:50000:5000:30 --nccl --report
 ```
 
-Example report:
+When `--sweep` and `--nccl` are both active, Basidium launches an NCCL test at each sweep step and waits for it to complete before advancing to the next PPS level. The first step's busbw becomes the baseline; subsequent steps report degradation relative to that baseline. This produces per-step correlation showing exactly how congestion affects application-layer throughput.
+
+> **Note:** The NCCL test runs concurrently with injection, so it measures busbw under active congestion. The sweep hold time should be at least as long as the NCCL test duration (typically 30-120s depending on `--nccl-binary` args). If the NCCL test takes longer than the hold period, the sweep waits for completion before moving on.
+
+Example report (with NCCL correlation):
 
 ```json
 {
-  "generated": "2026-04-02T22:00:00Z",
+  "generated": "2026-04-10T22:00:00Z",
   "interface": "eth0",
-  "mode": "mac",
+  "mode": "pfc",
   "threads": 1,
-  "duration_s": 50,
+  "duration_s": 180,
   "total_packets": 4823000,
-  "peak_pps": 98200,
-  "sweep": [
-    { "step": 1, "target_pps": 1000,  "achieved_pps": 999  },
-    { "step": 2, "target_pps": 11000, "achieved_pps": 10998 }
-  ]
+  "peak_pps": 48200,
+  "sweep": {
+    "start": 1000,
+    "end": 50000,
+    "step": 5000,
+    "hold_s": 30,
+    "nccl_baseline_busbw": 76.50,
+    "steps": [
+      {"pps_target": 1000,  "pps_achieved": 999,   "nccl_busbw": 76.50, "nccl_degradation_pct": 0.0},
+      {"pps_target": 6000,  "pps_achieved": 5998,  "nccl_busbw": 74.20, "nccl_degradation_pct": -3.0},
+      {"pps_target": 11000, "pps_achieved": 10995, "nccl_busbw": 68.10, "nccl_degradation_pct": -11.0},
+      {"pps_target": 16000, "pps_achieved": 15990, "nccl_busbw": 52.30, "nccl_degradation_pct": -31.6}
+    ]
+  }
+}
+```
+
+---
+
+## TCO — Targeted Congestion Orchestration
+
+Scenario files (`.tco`) define multi-step, multi-mode congestion patterns for automated fabric qualification. The orchestrator thread steps through each configuration, dynamically switching worker threads between flood modes at runtime. With `--nccl`, each step measures application-layer throughput under the current congestion conditions.
+
+```mermaid
+flowchart TD
+    LOAD["Load .tco scenario"] --> STEP["Apply step: set mode + PPS"]
+    STEP --> INJECT["Workers inject at target rate"]
+    INJECT --> NCCL_Q{"--nccl?"}
+    NCCL_Q --> |yes| NCCL_RUN["Launch NCCL test<br/>measure busbw under congestion"]
+    NCCL_Q --> |no| HOLD["Hold for duration_s"]
+    NCCL_RUN --> HOLD
+    HOLD --> RECORD["Record achieved PPS + busbw"]
+    RECORD --> MORE{"More steps?"}
+    MORE --> |yes| STEP
+    MORE --> |no| REPORT["Write JSON report + exit"]
+```
+
+### Scenario File Format
+
+```
+# Each line: mode  pps  duration_s  [nccl]
+# Comments start with #. Blank lines ignored.
+
+mac   1000  30  nccl     # baseline: light MAC flood + NCCL measurement
+pfc   5000  60  nccl     # light PFC stress
+pfc  20000  60  nccl     # moderate PFC stress
+pfc  50000  60  nccl     # heavy PFC stress
+arp  10000  30           # ARP storm (no NCCL measurement this step)
+mac   1000  30  nccl     # recovery baseline
+```
+
+### Usage
+
+```sh
+# Run scenario with NCCL correlation
+sudo ./basidium -i eth0 --scenario /path/to/scenario.tco --nccl --report
+
+# Run scenario without NCCL
+sudo ./basidium -i eth0 --scenario examples/pfc-stress-ramp.tco --report
+```
+
+### Example Report (with NCCL)
+
+```json
+{
+  "scenario": {
+    "name": "pfc-stress-ramp",
+    "file": "examples/pfc-stress-ramp.tco",
+    "nccl_baseline_busbw": 76.50,
+    "steps": [
+      {"mode": "mac", "pps_target": 1000,  "duration_s": 30, "pps_achieved": 999,   "nccl_busbw": 76.50, "nccl_degradation_pct": 0.0},
+      {"mode": "pfc", "pps_target": 5000,  "duration_s": 60, "pps_achieved": 4998,  "nccl_busbw": 74.20, "nccl_degradation_pct": -3.0},
+      {"mode": "pfc", "pps_target": 20000, "duration_s": 60, "pps_achieved": 19995, "nccl_busbw": 68.10, "nccl_degradation_pct": -11.0},
+      {"mode": "pfc", "pps_target": 50000, "duration_s": 60, "pps_achieved": 49800, "nccl_busbw": 52.30, "nccl_degradation_pct": -31.6},
+      {"mode": "arp", "pps_target": 10000, "duration_s": 30, "pps_achieved": 9998},
+      {"mode": "mac", "pps_target": 1000,  "duration_s": 30, "pps_achieved": 999,   "nccl_busbw": 75.80, "nccl_degradation_pct": -0.9}
+    ]
+  }
 }
 ```
 
@@ -609,3 +738,5 @@ All packet builders accept a per-thread `struct rng_state *` parameter. No globa
 
 For authorized laboratory use.  
 © Matthew Stits — https://github.com/mstits/Basidium
+
+*Build your models on a solid pedestal.*

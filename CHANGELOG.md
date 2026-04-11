@@ -2,6 +2,14 @@
 
 All notable changes to Basidium are documented here.
 
+## [Unreleased]
+
+### Added
+- **NCCL-correlated rate sweep** — when `--sweep` and `--nccl` are both active, Basidium automatically launches an NCCL test at each sweep step and records per-step bus bandwidth alongside achieved PPS. The JSON report now includes `nccl_busbw` and `nccl_degradation_pct` fields per step, with the first step's result used as the baseline if none was set manually. The sweep thread holds the current PPS level until the NCCL test completes, ensuring measurements reflect actual congestion conditions.
+- **TCO (Targeted Congestion Orchestration)** — new `--scenario <file>` flag to run multi-step, multi-mode congestion patterns. Scenario files (`.tco`) define sequences of mode/PPS/duration steps with optional per-step NCCL correlation. Workers dynamically switch modes at runtime. New module: `tco.c`/`tco.h`. Example scenario in `examples/pfc-stress-ramp.tco`.
+
+### Fixed
+- **Worker fast-path stale mode check** — the MAC fast-path optimization was computed once at worker startup, meaning runtime mode changes (from TCO orchestration) would not take effect. Now the fast path also checks `conf.mode == MODE_MAC` each iteration.
 ## [2.3] — 2026-04-06
 
 ### Added

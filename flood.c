@@ -6,6 +6,7 @@
  */
 #define _GNU_SOURCE
 #include "flood.h"
+#include "nccl.h"
 
 #include <arpa/inet.h>
 #include <err.h>
@@ -610,11 +611,15 @@ void *worker_func(void *arg) {
     struct ether_header_custom *eth = (struct ether_header_custom *)buffer;
     uint64_t local_sent       = 0;
     int      inject_failures  = 0;
-
-    /* fast path: mode 0, no stealth/learning/targeting/VLAN-range */
-    int use_fast_mac = (conf.mode == MODE_MAC && !conf.learning && !conf.stealth &&
-                        conf.target_count == 0 &&
-                        !(conf.vlan_range_end > conf.vlan_id));
+    /* fast path eligible: mode 0, no stealth/learning/targeting/VLAN-range.
+     * Also disabled when a TCO scenario is active: mode switches corrupt the
+     * template buffer (ether_type, payload), and the fast path only overwrites
+     * the 12 MAC bytes.  Switching MAC→PFC→MAC would leave stale PFC data.
+     * We also re-check conf.mode at runtime as a safety net. */
+    int fast_mac_eligible = (!conf.scenario_file &&
+                             !conf.learning && !conf.stealth &&
+                             conf.target_count == 0 &&
+                             !(conf.vlan_range_end > conf.vlan_id));
 
     unsigned long long last_bcast_rx = 0;
 
@@ -632,7 +637,7 @@ void *worker_func(void *arg) {
             usleep(50000);
 
         /* ---- Fast Path ---- */
-        if (use_fast_mac) {
+        if (fast_mac_eligible && conf.mode == MODE_MAC) {
             uint64_t r1 = xorshift128plus(rng.s);
             uint64_t r2 = xorshift128plus(rng.s);
 
@@ -771,6 +776,11 @@ void *sweep_thread_func(void *arg) {
     if (total > MAX_SWEEP_STEPS) total = MAX_SWEEP_STEPS;
     atomic_store(&sweep_total_steps, total);
 
+    /* If NCCL correlation is active, record baseline before first step ramp.
+     * We use the existing baseline if one was set (--nccl + 'b' key in TUI),
+     * otherwise the first step's result becomes the implicit reference. */
+    int nccl_correlate = conf.nccl;
+
     int step = 0;
     for (int pps = conf.sweep_start;
          pps <= conf.sweep_end && is_running && step < MAX_SWEEP_STEPS;
@@ -779,6 +789,23 @@ void *sweep_thread_func(void *arg) {
         conf.pps = pps;
         atomic_store(&sweep_step_num, step + 1);
 
+        /* Launch NCCL test at the start of this step's hold period.
+         * The test runs concurrently with injection at the current PPS. */
+        int nccl_launched = 0;
+        if (nccl_correlate) {
+            if (nccl_launch() == 0) {
+                nccl_launched = 1;
+                log_event("SWEEP_NCCL", "NCCL test launched for sweep step");
+            } else {
+                log_event("SWEEP_NCCL", "NCCL launch failed (busy or error)");
+            }
+        }
+
+        /* Snapshot NIC stats at step start */
+        struct nic_stats nic_before;
+        int have_nic = (nic_stats_read(conf.interface, &nic_before) == 0);
+
+        /* Hold at this PPS level — this is the measurement window */
         unsigned long long sent_start = (unsigned long long)total_sent;
 
         for (int t = conf.sweep_hold; t > 0 && is_running; t--) {
@@ -791,9 +818,55 @@ void *sweep_thread_func(void *arg) {
             ? (sent_end - sent_start) / conf.sweep_hold
             : 0;
 
-        char msg[64];
-        snprintf(msg, sizeof(msg), "step %d/%d pps=%d achieved=%llu",
-                 step + 1, total, pps, sweep_step_pps[step]);
+        /* Compute NIC stats delta for this step */
+        if (have_nic) {
+            struct nic_stats nic_after;
+            if (nic_stats_read(conf.interface, &nic_after) == 0) {
+                sweep_step_nic_delta[step].tx_packets = nic_after.tx_packets - nic_before.tx_packets;
+                sweep_step_nic_delta[step].tx_bytes   = nic_after.tx_bytes   - nic_before.tx_bytes;
+                sweep_step_nic_delta[step].tx_dropped = nic_after.tx_dropped - nic_before.tx_dropped;
+                sweep_step_nic_delta[step].tx_errors  = nic_after.tx_errors  - nic_before.tx_errors;
+                sweep_step_nic_delta[step].rx_packets = nic_after.rx_packets - nic_before.rx_packets;
+                sweep_step_nic_delta[step].rx_bytes   = nic_after.rx_bytes   - nic_before.rx_bytes;
+                sweep_step_nic_valid[step] = 1;
+            }
+        }
+
+        /* Wait for NCCL to finish if it was launched.
+         * We keep the current PPS level active until NCCL completes so the
+         * measurement reflects the actual congestion conditions. */
+        if (nccl_launched) {
+            int nccl_wait = 300; /* max 5 minutes for NCCL to finish */
+            while (nccl.status == NCCL_RUNNING && is_running && nccl_wait-- > 0) {
+                atomic_store(&sweep_hold_rem, 0);
+                sleep(1);
+            }
+            if (nccl.status == NCCL_DONE && nccl.result_count > 0) {
+                /* Use the last (largest message) result as representative */
+                sweep_step_nccl_busbw[step] =
+                    nccl.results[nccl.result_count - 1].bus_bw;
+                sweep_step_nccl_valid[step] = 1;
+
+                /* Set baseline from first successful measurement */
+                if (nccl.baseline_bus_bw <= 0.0)
+                    nccl_set_baseline();
+            }
+        }
+
+        char msg[128];
+        if (sweep_step_nccl_valid[step]) {
+            double delta = (nccl.baseline_bus_bw > 0.0)
+                ? ((sweep_step_nccl_busbw[step] - nccl.baseline_bus_bw)
+                   / nccl.baseline_bus_bw) * 100.0
+                : 0.0;
+            snprintf(msg, sizeof(msg),
+                     "step %d/%d pps=%d achieved=%llu nccl=%.1f GB/s (%+.1f%%)",
+                     step + 1, total, pps, sweep_step_pps[step],
+                     sweep_step_nccl_busbw[step], delta);
+        } else {
+            snprintf(msg, sizeof(msg), "step %d/%d pps=%d achieved=%llu",
+                     step + 1, total, pps, sweep_step_pps[step]);
+        }
         log_event("SWEEP_STEP", msg);
     }
 

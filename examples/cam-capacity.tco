@@ -1,0 +1,24 @@
+# CAM Table Capacity Characterization
+#
+# Ramps MAC flood rate to find the point where the switch's CAM table
+# fills and it degrades to hub mode (fail-open).  Use with --detect
+# to automatically flag the step where fail-open is first observed.
+#
+# Expected behavior:
+#   Early steps:  Switch learns MACs normally, no drops
+#   Mid steps:    CAM table fills; dot1dTpLearnedEntryDiscards climbs
+#   Late steps:   Fail-open detected; all ports receive all traffic
+#   Recovery:     After flood stops, CAM ages out and switch recovers
+#
+# Run with:
+#   sudo ./basidium -i eth0 --scenario examples/cam-capacity.tco \
+#        --detect --report --nccl
+#
+# Format: mode  pps  duration_s  [nccl]
+
+mac    1000   20  nccl    # baseline — light flood, CAM should handle
+mac    5000   20  nccl    # moderate — watch for discard counter climb
+mac   10000   20  nccl    # moderate-heavy
+mac   20000   30  nccl    # heavy — likely CAM fill on most switches
+mac   50000   30  nccl    # saturation — confirm fail-open behavior
+mac    1000   30  nccl    # recovery — verify CAM ages out, NCCL recovers

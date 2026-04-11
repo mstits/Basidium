@@ -31,6 +31,9 @@ jobs:
       - name: Version check
         run: ./basidium --version
 
+      - name: Scenario dry-run
+        run: ./basidium --dry-run --scenario examples/ci-smoke.tco
+
   build-macos:
     runs-on: macos-latest
 
@@ -51,3 +54,6 @@ jobs:
 
       - name: Version check
         run: ./basidium --version
+
+      - name: Scenario dry-run
+        run: ./basidium --dry-run --scenario examples/ci-smoke.tco

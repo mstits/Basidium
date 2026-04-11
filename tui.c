@@ -19,6 +19,7 @@
 #include "tui.h"
 #include "flood.h"
 #include "nccl.h"
+#include "tco.h"
 #include "profiles.h"
 #include "nic_stats.h"
 
@@ -649,7 +650,14 @@ static void draw_help(void) {
     HL("  --sweep start:end:step[:hold_s]");
     HL("          Ramp rate from start to end pps in steps");
     HL("          hold_s = seconds per step (default: 10)");
+    HL("  With --nccl: auto-measures NCCL busbw per step");
     HL("  Tip: pair --sweep with --report for benchmark JSON");
+    HBLK();
+    HH("TCO (TARGETED CONGESTION ORCHESTRATION)");
+    HL("  --scenario <file.tco>");
+    HL("          Run multi-step, multi-mode congestion pattern");
+    HL("          File format: mode  pps  duration_s  [nccl]");
+    HL("          Mutually exclusive with --sweep");
     HBLK();
     HH("NETWORK I/O");
     HL("  --pcap-out <file>     Write packets to .pcap");
@@ -1000,45 +1008,114 @@ void tui_draw(void) {
     mvwprintw(w_config, 1, 2, "Mode:    %s", mode_to_string(conf.mode));
 
     /* Rate / sweep display */
+    int cfg_row = 2;
     if (conf.sweep_enabled && (int)sweep_total_steps > 0) {
         int sn   = (int)sweep_step_num;
         int st   = (int)sweep_total_steps;
         int rem  = (int)sweep_hold_rem;
         wattron(w_config, COLOR_PAIR(CP_WARN));
-        mvwprintw(w_config, 2, 2, "SWEEP  %d→%d  stp %d",
+        mvwprintw(w_config, cfg_row++, 2, "SWEEP  %d\u2192%d  stp %d",
                   conf.sweep_start, conf.sweep_end, conf.sweep_step);
-        mvwprintw(w_config, 3, 2, "Step %d/%d  next: %ds",
-                  sn, st, rem);
+        if (conf.nccl && nccl.status == NCCL_RUNNING && rem == 0)
+            mvwprintw(w_config, cfg_row++, 2, "Step %d/%d  NCCL...",
+                      sn, st);
+        else
+            mvwprintw(w_config, cfg_row++, 2, "Step %d/%d  next: %ds",
+                      sn, st, rem);
         wattroff(w_config, COLOR_PAIR(CP_WARN));
+        /* Show last completed step's NCCL result */
+        if (conf.nccl && sn > 0) {
+            int last = sn - 1; /* most recently completed step index */
+            if (last > 0 && sweep_step_nccl_valid[last - 1]) {
+                double bw = sweep_step_nccl_busbw[last - 1];
+                if (nccl.baseline_bus_bw > 0.0) {
+                    double d = ((bw - nccl.baseline_bus_bw)
+                                / nccl.baseline_bus_bw) * 100.0;
+                    int nc = (d < -10.0) ? CP_ALERT :
+                             (d < -3.0)  ? CP_WARN  : CP_GOOD;
+                    wattron(w_config, COLOR_PAIR(nc));
+                    mvwprintw(w_config, cfg_row++, 2,
+                              "NCCL %.1f GB/s  %+.1f%%", bw, d);
+                    wattroff(w_config, COLOR_PAIR(nc));
+                } else {
+                    mvwprintw(w_config, cfg_row++, 2,
+                              "NCCL %.1f GB/s", bw);
+                }
+            } else if (sweep_step_nccl_valid[0]) {
+                /* Show first step result while still on step 1 */
+                mvwprintw(w_config, cfg_row++, 2,
+                          "NCCL %.1f GB/s (baseline)",
+                          sweep_step_nccl_busbw[0]);
+            }
+        }
+    } else if (conf.scenario_file && tco_scenario.step_count > 0) {
+        /* TCO scenario display */
+        int sn  = (int)tco_current_step;
+        int st  = tco_scenario.step_count;
+        int rem = (int)tco_step_rem;
+        wattron(w_config, COLOR_PAIR(CP_WARN));
+        mvwprintw(w_config, cfg_row++, 2, "TCO  %s  (%d steps)",
+                  tco_scenario.name, st);
+        if (sn > 0 && sn <= st) {
+            struct tco_step *cur = &tco_scenario.steps[sn - 1];
+            if (conf.nccl && nccl.status == NCCL_RUNNING && rem == 0)
+                mvwprintw(w_config, cfg_row++, 2,
+                          "Step %d/%d %s %dpps NCCL...",
+                          sn, st, mode_to_string(cur->mode), cur->pps);
+            else
+                mvwprintw(w_config, cfg_row++, 2,
+                          "Step %d/%d %s %dpps  %ds",
+                          sn, st, mode_to_string(cur->mode), cur->pps, rem);
+        }
+        wattroff(w_config, COLOR_PAIR(CP_WARN));
+        /* Show last completed step's NCCL result */
+        if (conf.nccl && sn > 1 && tco_results[sn - 2].nccl_valid) {
+            double bw = tco_results[sn - 2].nccl_busbw;
+            if (nccl.baseline_bus_bw > 0.0) {
+                double d = ((bw - nccl.baseline_bus_bw)
+                            / nccl.baseline_bus_bw) * 100.0;
+                int nc = (d < -10.0) ? CP_ALERT :
+                         (d < -3.0)  ? CP_WARN  : CP_GOOD;
+                wattron(w_config, COLOR_PAIR(nc));
+                mvwprintw(w_config, cfg_row++, 2,
+                          "NCCL %.1f GB/s  %+.1f%%", bw, d);
+                wattroff(w_config, COLOR_PAIR(nc));
+            } else {
+                mvwprintw(w_config, cfg_row++, 2,
+                          "NCCL %.1f GB/s", bw);
+            }
+        }
     } else if (conf.pps > 0) {
-        mvwprintw(w_config, 2, 2, "Rate:    %d pps", conf.pps);
+        mvwprintw(w_config, cfg_row++, 2, "Rate:    %d pps", conf.pps);
     } else {
-        mvwprintw(w_config, 2, 2, "Rate:    unlimited");
+        mvwprintw(w_config, cfg_row++, 2, "Rate:    unlimited");
     }
-    mvwprintw(w_config, 3, 2, "Threads: %d", conf.threads);
+    mvwprintw(w_config, cfg_row++, 2, "Threads: %d", conf.threads);
     if (conf.stealth)
-        mvwprintw(w_config, 4, 2, "OUI:     %02x:%02x:%02x",
+        mvwprintw(w_config, cfg_row++, 2, "OUI:     %02x:%02x:%02x",
                   conf.stealth_oui[0], conf.stealth_oui[1], conf.stealth_oui[2]);
     else
-        mvwprintw(w_config, 4, 2, "OUI:     random");
-    mvwprintw(w_config, 5, 2, "PktSize: %d bytes",
+        mvwprintw(w_config, cfg_row++, 2, "OUI:     random");
+    mvwprintw(w_config, cfg_row++, 2, "PktSize: %d bytes",
               conf.packet_size ? conf.packet_size : 64);
-    mvwprintw(w_config, 6, 2, "Learn: %-3s  Adapt: %-3s",
+    mvwprintw(w_config, cfg_row++, 2, "Learn: %-3s  Adapt: %-3s",
               conf.learning ? "on" : "off",
               conf.adaptive ? "on" : "off");
     if (conf.session_duration > 0)
-        mvwprintw(w_config, 7, 2, "Duration: %ds", conf.session_duration);
+        mvwprintw(w_config, cfg_row++, 2, "Duration: %ds", conf.session_duration);
 
-    /* VLAN and PFC status on the last row */
-    if (conf.vlan_id > 0 && conf.mode == MODE_PFC)
-        mvwprintw(w_config, 8, 2, "VLAN: n/a (PFC)  PFC pri:%d q:0x%04x",
-                  conf.pfc_priority, conf.pfc_quanta);
-    else if (conf.vlan_id > 0)
-        mvwprintw(w_config, 8, 2, "VLAN: %d  pcp:%d",
-                  conf.vlan_id, conf.vlan_pcp);
-    else if (conf.mode == MODE_PFC)
-        mvwprintw(w_config, 8, 2, "PFC pri:%d  quanta:0x%04x",
-                  conf.pfc_priority, conf.pfc_quanta);
+    /* VLAN and PFC status */
+    if (cfg_row < STATS_H - 1) {
+        if (conf.vlan_id > 0 && conf.mode == MODE_PFC)
+            mvwprintw(w_config, cfg_row, 2, "VLAN: n/a (PFC)  PFC pri:%d q:0x%04x",
+                      conf.pfc_priority, conf.pfc_quanta);
+        else if (conf.vlan_id > 0)
+            mvwprintw(w_config, cfg_row, 2, "VLAN: %d  pcp:%d",
+                      conf.vlan_id, conf.vlan_pcp);
+        else if (conf.mode == MODE_PFC)
+            mvwprintw(w_config, cfg_row, 2, "PFC pri:%d  quanta:0x%04x",
+                      conf.pfc_priority, conf.pfc_quanta);
+    }
 
     wnoutrefresh(w_config);
 

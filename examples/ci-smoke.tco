@@ -1,0 +1,4 @@
+# Fast scenario for CI/selftest — validates parser and mode switching
+# 2 steps, 1 second each — total runtime ~2s
+mac  1000  1
+pfc  1000  1
