@@ -23,7 +23,7 @@ Standard network qualification (like RFC 2544) does not exercise the fabric at t
 
 A *basidium* (from the Latin, meaning "little pedestal") is the structural foundation that supports and launches spores into the environment. While the mushroom's cap gets the attention, the basidium is the microscopic machinery that ensures the next generation actually takes flight.
 
-sIn a GPU cluster, **the network fabric is the basidium**. The models get the headlines, but they cannot exist without a stable pedestal. If the fabric is cracked, jittery, or misconfigured, the entire computational process fails, sometimes silently, sometimes catastrophically and sometimes its just a pain in the ass to debug with ATAC. Basidium ensures the pedestal doesn't buckle under the weight of line-rate traffic before you risk your training budget.
+In a GPU cluster, **the network fabric is the basidium**. The models get the headlines, but they cannot exist without a stable pedestal. If the fabric is cracked, jittery, or misconfigured, the entire computational process fails. Basidium ensures the pedestal doesn't buckle under the weight of line-rate traffic before you risk your training budget.
 
 ### Core Capabilities
 
@@ -58,7 +58,7 @@ graph LR
 - **Targeted Congestion Orchestration (TCO):** Define multi-step, multi-mode congestion scenarios (`.tco` files) that switch between flood modes at runtime while measuring NCCL degradation at each step.
 - **Regression Detection:** Identify performance drift caused by firmware updates, configuration changes, physical layer degradation, or incremental topology changes.
 
-> **⚠️ Authorization required.** Use only on airgapped hardware you own or have explicit written permission to test. Never run against production infrastructure or equipment belonging to others.
+> **Authorization required.** Use only on airgapped hardware you own or have explicit written permission to test. Never run against production infrastructure or equipment belonging to others.
 >
 > **Total Cluster Outage (TCO) Warning:** Many modules in this tool — specifically PFC flooding and TCO orchestration — are designed to halt traffic flow. Using these on a live environment will likely trigger a **Total Cluster Outage**. Periodic re-validation is a practical necessity, but it must be conducted in a controlled, isolated environment.
 
@@ -379,11 +379,26 @@ Launch with `--tui` (requires `make TUI=1`). Starts in **STANDBY** — no inject
 
 ---
 
-## SNMP Integration
+## Switch-Side Qualification Playbook
+
+Each flood mode targets a specific failure mode. The table below maps each mode to the switch counters and behavior you should observe during testing.
+
+### What to Watch Per Mode
+
+| Mode | Target Failure | Expected Switch Behavior | Key Counters / Logs |
+|------|---------------|-------------------------|---------------------|
+| `mac` | CAM table overflow, fail-open | `dot1dTpLearnedEntryDiscards` climbs; port may flood all frames. Use `--detect` to confirm. | `dot1dTpLearnedEntryDiscards` (1.3.6.1.2.1.17.4.3.1.3), `ifInDiscards` |
+| `pfc` | PFC deadlock, watchdog trigger | Target priority queue pauses; watch for PFC watchdog syslog events. Lossless traffic on that priority should halt. | Memory buffer utilization, PFC watchdog syslog, `cbQosPoliceCfgRate` |
+| `arp` | ARP table exhaustion | ARP table fills; new entries fail to resolve. Watch for ARP timeouts in switch logs. | `ipNetToMediaTable` (1.3.6.1.2.1.4.22), ARP cache size |
+| `dhcp` | DHCP pool starvation | DHCP server exhausts address pool. Useful for testing relay agent behavior. | DHCP server pool utilization, relay counters |
+| `stp` | Spanning-tree instability | TCN triggers MAC table flush followed by brief flood mode per flush. `dot1dStpTopChanges` should increment rapidly. | `dot1dStpTopChanges` (1.3.6.1.2.1.17.2.4), `dot1dStpRootPort` |
+| `igmp` | IGMP snooping table exhaustion | Snooping table fills; switch falls back to flooding multicast. | `igmpCacheTable` (1.3.6.1.2.1.85.1.2), multicast group count |
+| `lldp` | Control-plane CPU stress | LLDP neighbor count climbs; switch CPU may spike. Watch for LLDP flap warnings. | `lldpRemTable`, CPU utilization MIB |
+| `nd` | IPv6 ND table exhaustion | ND cache fills; neighbor resolution fails for legitimate hosts. | IPv6 neighbor cache size, ICMPv6 error counters |
 
 Basidium's JSON event log and session reports pair directly with SNMP polling to correlate injection activity with live switch MIB counters.
 
-### Useful MIB OIDs
+### Useful MIB OIDs (Reference)
 
 | Metric | MIB Object | OID |
 |--------|-----------|-----|
@@ -707,6 +722,7 @@ sudo ./basidium --profile stp-flood
 basidium.c      main(), CLI parsing, thread orchestration, SIGINT/SIGTERM
 flood.c         packet builders, worker threads, sniffer, RNG, selftest
 flood.h         shared types, flood_mode_t enum, config struct, prototypes
+tco.c/.h        TCO scenario parser + orchestrator thread
 tui.c           ncurses TUI (make TUI=1)
 nccl.c/.h       NCCL subprocess orchestration
 profiles.c/.h   named profile save/load (~/.basidium/) with name sanitization
