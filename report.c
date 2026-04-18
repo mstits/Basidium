@@ -10,10 +10,12 @@
 #include "nccl.h"
 #include "tco.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 static void write_esc(FILE *fp, const char *s) {
     /* minimal JSON string escaping */
@@ -27,7 +29,7 @@ static void write_esc(FILE *fp, const char *s) {
     fputc('"', fp);
 }
 
-void write_report(const char *path, const struct nic_stats *final_nic) {
+int write_report(const char *path, const struct nic_stats *final_nic) {
     /* auto-generate filename if none specified */
     char auto_path[64];
     if (!path || path[0] == '\0') {
@@ -40,8 +42,9 @@ void write_report(const char *path, const struct nic_stats *final_nic) {
 
     FILE *fp = fopen(path, "w");
     if (!fp) {
-        fprintf(stderr, "report: cannot open %s for writing\n", path);
-        return;
+        fprintf(stderr, "report: cannot open %s for writing: %s\n",
+                path, strerror(errno));
+        return -1;
     }
 
     time_t now      = time(NULL);
@@ -214,7 +217,18 @@ void write_report(const char *path, const struct nic_stats *final_nic) {
     }
 
     fprintf(fp, "}\n");
-    fclose(fp);
+
+    /* Catch disk-full / stream errors before declaring success: ferror() covers
+     * buffered writes, fclose() flushes and can itself fail on a full disk. */
+    int write_err  = ferror(fp);
+    int close_err  = (fclose(fp) != 0);
+    if (write_err || close_err) {
+        fprintf(stderr, "report: write to %s failed (%s) — file removed\n",
+                path, write_err ? "stream error" : strerror(errno));
+        unlink(path);
+        return -1;
+    }
 
     printf("Report written to: %s\n", path);
+    return 0;
 }

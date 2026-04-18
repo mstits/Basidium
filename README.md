@@ -214,7 +214,7 @@ sudo make install
 # Custom prefix
 sudo make install PREFIX=/opt/local
 
-# Self-test (12 packet builder tests)
+# Self-test (14 validation tests: packet builders + TCO/NCCL parsers)
 sudo make selftest
 ```
 
@@ -344,7 +344,7 @@ Ramps injection rate from `start` to `end` PPS in `step` increments, holding eac
 ### Diagnostics
 | Flag | Description |
 |------|-------------|
-| `--selftest` | Run 12 built-in validation tests |
+| `--selftest` | Run 14 built-in validation tests |
 | `--version` | Print version and exit |
 | `--dry-run` | Build & count packets without injecting (no sudo needed) |
 

@@ -7,6 +7,7 @@
 #define _GNU_SOURCE
 #include "flood.h"
 #include "nccl.h"
+#include "tco.h"
 
 #include <arpa/inet.h>
 #include <err.h>
@@ -1096,6 +1097,88 @@ int run_selftest(void) {
         printf("[PASS] IP Checksum\n");
     }
 
-    printf("All 12 Tests Passed.\n");
+    /* Test 13: TCO scenario parser */
+    {
+        char path[] = "/tmp/basidium-tco-selftest.XXXXXX";
+        int fd = mkstemp(path);
+        if (fd < 0) errx(1, "FAIL: TCO could not create temp file");
+        FILE *fp = fdopen(fd, "w");
+        if (!fp) { close(fd); unlink(path); errx(1, "FAIL: TCO fdopen failed"); }
+        fputs("# header comment\n"
+              "\n"
+              "mac  1000  30\n"
+              "pfc  5000  60  nccl\n"
+              "arp   200  15\n", fp);
+        fclose(fp);
+
+        int rc = tco_load(path);
+        unlink(path);
+        if (rc != 0) errx(1, "FAIL: TCO parser rejected valid scenario");
+        if (tco_scenario.step_count != 3)
+            errx(1, "FAIL: TCO step_count=%d (expected 3)", tco_scenario.step_count);
+        if (tco_scenario.steps[0].mode != MODE_MAC
+            || tco_scenario.steps[0].pps != 1000
+            || tco_scenario.steps[0].duration_s != 30
+            || tco_scenario.steps[0].run_nccl != 0)
+            errx(1, "FAIL: TCO step 0 fields incorrect");
+        if (tco_scenario.steps[1].mode != MODE_PFC
+            || tco_scenario.steps[1].pps != 5000
+            || tco_scenario.steps[1].duration_s != 60
+            || tco_scenario.steps[1].run_nccl != 1)
+            errx(1, "FAIL: TCO step 1 fields incorrect");
+        if (tco_scenario.steps[2].mode != MODE_ARP
+            || tco_scenario.steps[2].pps != 200
+            || tco_scenario.steps[2].duration_s != 15)
+            errx(1, "FAIL: TCO step 2 fields incorrect");
+
+        /* Negative: unknown mode must be rejected. Suppress expected stderr. */
+        char bad_path[] = "/tmp/basidium-tco-bad.XXXXXX";
+        int bfd = mkstemp(bad_path);
+        if (bfd < 0) errx(1, "FAIL: TCO could not create temp file");
+        FILE *bfp = fdopen(bfd, "w");
+        if (!bfp) { close(bfd); unlink(bad_path); errx(1, "FAIL: TCO fdopen failed"); }
+        fputs("bogus 1000 10\n", bfp);
+        fclose(bfp);
+
+        fflush(stderr);
+        int saved_stderr = dup(STDERR_FILENO);
+        if (!freopen("/dev/null", "w", stderr)) { /* non-fatal */ }
+        int bad_rc = tco_load(bad_path);
+        fflush(stderr);
+        if (saved_stderr >= 0) {
+            dup2(saved_stderr, STDERR_FILENO);
+            close(saved_stderr);
+        }
+        unlink(bad_path);
+        if (bad_rc == 0) errx(1, "FAIL: TCO accepted unknown mode");
+
+        memset(&tco_scenario, 0, sizeof(tco_scenario));
+        printf("[PASS] TCO Scenario Parser\n");
+    }
+
+    /* Test 14: NCCL output parser */
+    {
+        struct nccl_result r;
+        const char *data =
+            "  33554432  8388608  float  sum  820.5  40.89  76.67  N/A  0\n";
+        if (!nccl_parse_line(data, &r))
+            errx(1, "FAIL: NCCL parser rejected valid data line");
+        if (r.msg_size != 33554432)
+            errx(1, "FAIL: NCCL msg_size=%zu (expected 33554432)", r.msg_size);
+        if (r.alg_bw < 40.88 || r.alg_bw > 40.90)
+            errx(1, "FAIL: NCCL alg_bw=%.3f (expected ~40.89)", r.alg_bw);
+        if (r.bus_bw < 76.66 || r.bus_bw > 76.68)
+            errx(1, "FAIL: NCCL bus_bw=%.3f (expected ~76.67)", r.bus_bw);
+
+        if (nccl_parse_line("# size  count  type  redop  time  algbw  busbw\n", &r))
+            errx(1, "FAIL: NCCL parser accepted header/comment line");
+        if (nccl_parse_line("\n", &r))
+            errx(1, "FAIL: NCCL parser accepted blank line");
+        if (nccl_parse_line("   123  456\n", &r))
+            errx(1, "FAIL: NCCL parser accepted truncated line");
+        printf("[PASS] NCCL Output Parser\n");
+    }
+
+    printf("All 14 Tests Passed.\n");
     return 0;
 }

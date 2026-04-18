@@ -35,8 +35,10 @@ static pthread_mutex_t nccl_mutex = PTHREAD_MUTEX_INITIALIZER;
  *
  * Data lines start with whitespace then a numeric size value.
  * Format: size count type redop time algbw busbw #wrong ...
+ *
+ * Exposed for selftest coverage.
  */
-static int parse_nccl_line(const char *line, struct nccl_result *out) {
+int nccl_parse_line(const char *line, struct nccl_result *out) {
     /* Skip comment/header lines */
     if (line[0] == '#' || line[0] == '\n' || line[0] == '\0')
         return 0;
@@ -81,7 +83,7 @@ static void *nccl_run_thread(void *arg) {
         if (count >= NCCL_MAX_RESULTS)
             break;
         struct nccl_result r;
-        if (parse_nccl_line(line, &r))
+        if (nccl_parse_line(line, &r))
             results[count++] = r;
     }
 

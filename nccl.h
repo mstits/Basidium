@@ -53,4 +53,7 @@ int   nccl_launch(void);              /* spawns background thread, returns 0 on 
 void  nccl_set_baseline(void);        /* stores current bus_bw as baseline */
 void  nccl_get_summary(char *buf, size_t len); /* formatted one-line summary for TUI */
 
+/* Exposed for selftest: parses one nccl-tests output line (1=data row, 0=skip). */
+int   nccl_parse_line(const char *line, struct nccl_result *out);
+
 #endif /* NCCL_MODULE_H */

@@ -219,7 +219,8 @@ hours, e.g.
 .SS "Diagnostics"
 .TP
 .B \-\-selftest
-Run 12 built-in packet builder validation tests and exit.
+Run 14 built-in validation tests (packet builders, TCO scenario parser,
+NCCL output parser) and exit.
 .TP
 .B \-\-version
 Print version and exit.
@@ -305,8 +306,9 @@ Exit status 0 on success, 1 on fatal error, 2 if fail-open was detected
 .PP
 The
 .B \-\-selftest
-flag runs 12 packet builder tests (MAC, ARP, DHCP, VLAN, PFC, ND, LLDP,
-STP TCN, QinQ, IGMP, payload pattern, IP checksum) and exits 0 if all pass.
+flag runs 14 tests (MAC, ARP, DHCP, VLAN, PFC, ND, LLDP, STP TCN, QinQ,
+IGMP, payload pattern, IP checksum, TCO scenario parser, NCCL output
+parser) and exits 0 if all pass.
 .SH NOTES
 Requires root privileges for raw packet injection via libpcap.
 .PP

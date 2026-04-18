@@ -17,7 +17,11 @@
  * Pass NULL for `path` to auto-generate "basidium-YYYYMMDD-HHMMSS.json"
  * in the current directory.
  * `final_nic` may be NULL if NIC stats are unavailable.
+ *
+ * Returns 0 on success, -1 on failure. On failure an error is printed to
+ * stderr and any partial file is removed so downstream tooling doesn't
+ * consume half-written JSON.
  */
-void write_report(const char *path, const struct nic_stats *final_nic);
+int write_report(const char *path, const struct nic_stats *final_nic);
 
 #endif /* REPORT_H */

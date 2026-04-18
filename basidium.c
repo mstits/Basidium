@@ -151,7 +151,7 @@ static void usage(void) {
     printf("  --payload <pattern>     MAC flood payload fill: zeros ff dead incr (default: zeros)\n\n");
 
     printf("\033[1mDIAGNOSTICS:\033[0m\n");
-    printf("  --selftest   Run built-in packet builder validation suite\n");
+    printf("  --selftest   Run built-in validation suite (builders + parsers, 14 tests)\n");
     printf("  --version    Print version and exit\n");
     printf("  --dry-run    Build & count packets without injecting (no sudo needed)\n\n");
 
@@ -223,7 +223,11 @@ int main(int argc, char **argv) {
             if (strcmp(name, "tui")         == 0) conf.tui            = 1;
             if (strcmp(name, "nccl")        == 0) conf.nccl           = 1;
             if (strcmp(name, "nccl-binary") == 0) { conf.nccl = 1; nccl_init(optarg); }
-            if (strcmp(name, "profile")     == 0) profiles_load(optarg, &conf);
+            if (strcmp(name, "profile")     == 0) {
+                if (profiles_load(optarg, &conf) != 0)
+                    errx(1, "failed to load profile '%s' — check ~/.basidium/%s.conf",
+                         optarg, optarg);
+            }
             if (strcmp(name, "vlan-pcp")    == 0) conf.vlan_pcp      = atoi(optarg) & 0x7;
             if (strcmp(name, "pfc-priority")== 0) conf.pfc_priority  = atoi(optarg) & 0x7;
             if (strcmp(name, "pfc-quanta")  == 0) conf.pfc_quanta    = (int)strtol(optarg, NULL, 0);
@@ -375,7 +379,9 @@ int main(int argc, char **argv) {
     pthread_t sniff_th;
     int sniff_running = 0;
     if (conf.learning || conf.adaptive || conf.detect_failopen) {
-        pthread_create(&sniff_th, NULL, sniffer_thread_func, NULL);
+        int rc = pthread_create(&sniff_th, NULL, sniffer_thread_func, NULL);
+        if (rc != 0)
+            errx(1, "failed to start sniffer thread: %s", strerror(rc));
         sniff_running = 1;
         if (!conf.tui)
             printf("Sniffer running (learning=%d adaptive=%d detect=%d)\n",
@@ -396,7 +402,9 @@ int main(int argc, char **argv) {
     int sweep_running = 0;
     if (conf.sweep_enabled && !conf.scenario_file) {
         conf.pps = conf.sweep_start;
-        pthread_create(&sweep_th, NULL, sweep_thread_func, NULL);
+        int rc = pthread_create(&sweep_th, NULL, sweep_thread_func, NULL);
+        if (rc != 0)
+            errx(1, "failed to start sweep thread: %s", strerror(rc));
         sweep_running = 1;
         if (!conf.tui)
             printf("Sweep: %d→%d pps, step %d, hold %ds%s\n",
@@ -415,7 +423,9 @@ int main(int argc, char **argv) {
         }
         if (tco_load(conf.scenario_file) != 0)
             exit(1);
-        pthread_create(&tco_th, NULL, tco_thread_func, NULL);
+        int rc = pthread_create(&tco_th, NULL, tco_thread_func, NULL);
+        if (rc != 0)
+            errx(1, "failed to start TCO thread: %s", strerror(rc));
         tco_running = 1;
         if (!conf.tui)
             printf("TCO scenario: %s (%d steps)%s\n",
@@ -428,7 +438,9 @@ int main(int argc, char **argv) {
     int replay_running = 0;
 
     if (conf.pcap_replay_file) {
-        pthread_create(&replay_th, NULL, pcap_replay_func, NULL);
+        int rc = pthread_create(&replay_th, NULL, pcap_replay_func, NULL);
+        if (rc != 0)
+            errx(1, "failed to start replay thread: %s", strerror(rc));
         replay_running = 1;
         if (!conf.tui)
             printf("Replaying: %s\n", conf.pcap_replay_file);
@@ -437,7 +449,9 @@ int main(int argc, char **argv) {
             thread_ids[i] = i;
             if (conf.verbose && !conf.tui)
                 printf("[thread %d] starting\n", i);
-            pthread_create(&workers[i], NULL, worker_func, &thread_ids[i]);
+            int rc = pthread_create(&workers[i], NULL, worker_func, &thread_ids[i]);
+            if (rc != 0)
+                errx(1, "failed to start worker thread %d: %s", i, strerror(rc));
         }
     }
 

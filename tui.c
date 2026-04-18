@@ -673,7 +673,7 @@ static void draw_help(void) {
     HL("  --payload pattern      zeros ff dead incr (default: zeros)");
     HBLK();
     HH("DIAGNOSTICS");
-    HL("  --selftest   Run built-in packet builder validation suite");
+    HL("  --selftest   Run built-in validation suite (builders + parsers, 14 tests)");
 
 #undef HL
 #undef HH

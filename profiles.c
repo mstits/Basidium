@@ -9,6 +9,7 @@
 
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,8 +45,52 @@ void profiles_dir(char *out, size_t len) {
     snprintf(out, len, "%s/.basidium", home);
 }
 
-static void ensure_dir(const char *path) {
-    mkdir(path, 0755);
+static int ensure_dir(const char *path) {
+    if (mkdir(path, 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "profiles: cannot create %s: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Validate a loaded profile's numeric fields. Any out-of-range value is
+ * treated as profile corruption — emit a diagnostic and reject the load
+ * rather than silently clamping, so the operator fixes the profile instead
+ * of running with surprising values.
+ */
+static int profile_validate(const struct config *c, const char *name) {
+    const char *err = NULL;
+    if (c->threads < 0 || c->threads > MAX_THREADS)
+        err = "threads out of range (0..16)";
+    else if (c->pps < 0)
+        err = "pps must be >= 0";
+    else if (c->packet_size != 0 &&
+             (c->packet_size < 60 || c->packet_size > MAX_PACKET_SIZE))
+        err = "packet_size must be 0 or 60..9216";
+    else if (c->vlan_id < 0 || c->vlan_id > 4094)
+        err = "vlan_id must be 0..4094";
+    else if (c->vlan_pcp < 0 || c->vlan_pcp > 7)
+        err = "vlan_pcp must be 0..7";
+    else if (c->vlan_range_end < 0 || c->vlan_range_end > 4094)
+        err = "vlan_range_end must be 0..4094";
+    else if (c->qinq_outer_vid < 0 || c->qinq_outer_vid > 4094)
+        err = "qinq_outer_vid must be 0..4094";
+    else if (c->pfc_priority < 0 || c->pfc_priority > 7)
+        err = "pfc_priority must be 0..7";
+    else if (c->pfc_quanta < 0 || c->pfc_quanta > 0xFFFF)
+        err = "pfc_quanta must be 0..65535";
+    else if (c->payload_pattern < 0 || c->payload_pattern > 3)
+        err = "payload_pattern must be 0..3";
+    else if (c->session_duration < 0)
+        err = "session_duration must be >= 0";
+
+    if (err) {
+        fprintf(stderr, "profile '%s': %s\n", name, err);
+        return -1;
+    }
+    return 0;
 }
 
 int profiles_save(const char *name, const struct config *conf) {
@@ -53,13 +98,17 @@ int profiles_save(const char *name, const struct config *conf) {
 
     char dir[PROFILE_DIR_MAX];
     profiles_dir(dir, sizeof(dir));
-    ensure_dir(dir);
+    if (ensure_dir(dir) != 0) return -1;
 
     char path[PROFILE_DIR_MAX + PROFILE_NAME_MAX + 8];
     snprintf(path, sizeof(path), "%s/%s.conf", dir, name);
 
     FILE *fp = fopen(path, "w");
-    if (!fp) return -1;
+    if (!fp) {
+        fprintf(stderr, "profiles: cannot write %s: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
 
     fprintf(fp, "# Basidium profile: %s\n", name);
     fprintf(fp, "interface=%s\n",        conf->interface ? conf->interface : "");
@@ -97,7 +146,11 @@ int profiles_save(const char *name, const struct config *conf) {
 }
 
 int profiles_load(const char *name, struct config *conf) {
-    if (!profile_name_safe(name)) return -1;
+    if (!profile_name_safe(name)) {
+        fprintf(stderr, "profiles: unsafe profile name '%s'\n",
+                name ? name : "(null)");
+        return -1;
+    }
 
     char dir[PROFILE_DIR_MAX];
     profiles_dir(dir, sizeof(dir));
@@ -106,7 +159,11 @@ int profiles_load(const char *name, struct config *conf) {
     snprintf(path, sizeof(path), "%s/%s.conf", dir, name);
 
     FILE *fp = fopen(path, "r");
-    if (!fp) return -1;
+    if (!fp) {
+        fprintf(stderr, "profiles: cannot open %s: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
 
     char line[512];
     while (fgets(line, sizeof(line), fp)) {
@@ -153,7 +210,7 @@ int profiles_load(const char *name, struct config *conf) {
     }
 
     fclose(fp);
-    return 0;
+    return profile_validate(conf, name);
 }
 
 int profiles_list(char names[PROFILE_LIST_MAX][PROFILE_NAME_MAX]) {
