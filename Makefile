@@ -2,7 +2,7 @@ CC      = gcc
 CFLAGS  = -Wall -Wextra -Wformat=2 -O2 -D_FORTIFY_SOURCE=2
 LDFLAGS = -lpcap -pthread
 
-VERSION = 2.3
+VERSION = 2.4
 CFLAGS += -DBASIDIUM_VERSION=\"$(VERSION)\"
 
 TARGET  = basidium

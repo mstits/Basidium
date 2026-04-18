@@ -1,5 +1,5 @@
 /*
- * basidium.c v2.3
+ * basidium.c v2.4
  * Basidium — Advanced Multi-Threaded Layer-2 Stress / Hardware Evaluation Utility
  *
  * SPDX-License-Identifier: MIT
@@ -36,7 +36,7 @@
 #include <unistd.h>
 
 #ifndef BASIDIUM_VERSION
-#define BASIDIUM_VERSION "2.3"
+#define BASIDIUM_VERSION "2.4"
 #endif
 
 /* ---- Global state definitions (extern'd in flood.h) ---- */
