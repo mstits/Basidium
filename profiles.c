@@ -10,12 +10,46 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+/*
+ * Trim trailing CR/LF/whitespace.  Profile files edited on Windows or copied
+ * through CRLF-translating tools end up with stray \r that mode_from_string
+ * rejects ("mac\r" != "mac"), so loaders silently fall back to defaults.
+ * Trimming up front makes the rest of the parser CRLF-agnostic.
+ */
+static void rstrip(char *s) {
+    size_t n = strlen(s);
+    while (n > 0 && (s[n-1] == '\r' || s[n-1] == '\n' ||
+                     s[n-1] == ' '  || s[n-1] == '\t'))
+        s[--n] = '\0';
+}
+
+/* Validated int from a profile value string.  Reports the field name on
+ * failure rather than silently returning 0 the way atoi() does. */
+static int parse_int_field(const char *val, const char *field,
+                           int lo, int hi, const char *name) {
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(val, &end, 10);
+    if (end == val || (end && *end != '\0') || errno == ERANGE) {
+        fprintf(stderr, "profile '%s': %s='%s' is not an integer\n",
+                name, field, val);
+        return INT_MIN;
+    }
+    if (v < lo || v > hi) {
+        fprintf(stderr, "profile '%s': %s=%ld out of range (%d..%d)\n",
+                name, field, v, lo, hi);
+        return INT_MIN;
+    }
+    return (int)v;
+}
 
 /*
  * Sanitize a profile name to prevent path traversal.
@@ -36,13 +70,38 @@ static int profile_name_safe(const char *name) {
     return 1;
 }
 
+/*
+ * Resolve the profile directory.  Order:
+ *   1. $BASIDIUM_PROFILE_DIR (explicit override)
+ *   2. $XDG_CONFIG_HOME/basidium  (XDG basedir spec)
+ *   3. $HOME/.basidium            (legacy, kept for compat)
+ *   4. /tmp/.basidium             (last-ditch when no HOME)
+ * If the legacy ~/.basidium exists and the XDG path does not, we keep using
+ * the legacy path so existing profiles continue to load without migration.
+ */
 void profiles_dir(char *out, size_t len) {
+    const char *override_dir = getenv("BASIDIUM_PROFILE_DIR");
+    if (override_dir && override_dir[0]) {
+        snprintf(out, len, "%s", override_dir);
+        return;
+    }
     const char *home = getenv("HOME");
     if (!home) {
         struct passwd *pw = getpwuid(getuid());
         home = pw ? pw->pw_dir : "/tmp";
     }
-    snprintf(out, len, "%s/.basidium", home);
+    char legacy[PROFILE_DIR_MAX];
+    snprintf(legacy, sizeof(legacy), "%s/.basidium", home);
+    struct stat st;
+    if (stat(legacy, &st) == 0 && S_ISDIR(st.st_mode)) {
+        snprintf(out, len, "%s", legacy);
+        return;
+    }
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    if (xdg && xdg[0])
+        snprintf(out, len, "%s/basidium", xdg);
+    else
+        snprintf(out, len, "%s", legacy);
 }
 
 static int ensure_dir(const char *path) {
@@ -93,7 +152,7 @@ static int profile_validate(const struct config *c, const char *name) {
     return 0;
 }
 
-int profiles_save(const char *name, const struct config *conf) {
+int profiles_save(const char *name, const struct config *cfg) {
     if (!profile_name_safe(name)) return -1;
 
     char dir[PROFILE_DIR_MAX];
@@ -111,41 +170,41 @@ int profiles_save(const char *name, const struct config *conf) {
     }
 
     fprintf(fp, "# Basidium profile: %s\n", name);
-    fprintf(fp, "interface=%s\n",        conf->interface ? conf->interface : "");
-    fprintf(fp, "mode=%s\n",             mode_to_string(conf->mode));
-    fprintf(fp, "threads=%d\n",          conf->threads);
-    fprintf(fp, "pps=%d\n",              conf->pps);
-    fprintf(fp, "packet_size=%d\n",      conf->packet_size);
-    fprintf(fp, "stealth=%d\n",          conf->stealth);
+    fprintf(fp, "interface=%s\n",        cfg->interface ? cfg->interface : "");
+    fprintf(fp, "mode=%s\n",             mode_to_string(cfg->mode));
+    fprintf(fp, "threads=%d\n",          cfg->threads);
+    fprintf(fp, "pps=%d\n",              cfg->pps);
+    fprintf(fp, "packet_size=%d\n",      cfg->packet_size);
+    fprintf(fp, "stealth=%d\n",          cfg->stealth);
     fprintf(fp, "stealth_oui=%02x:%02x:%02x\n",
-            conf->stealth_oui[0], conf->stealth_oui[1], conf->stealth_oui[2]);
-    fprintf(fp, "learning=%d\n",         conf->learning);
-    fprintf(fp, "adaptive=%d\n",         conf->adaptive);
-    fprintf(fp, "allow_multicast=%d\n",  conf->allow_multicast);
-    fprintf(fp, "random_client_mac=%d\n",conf->random_client_mac);
-    fprintf(fp, "session_duration=%d\n", conf->session_duration);
-    fprintf(fp, "nccl=%d\n",             conf->nccl);
-    fprintf(fp, "vlan_id=%d\n",          conf->vlan_id);
-    fprintf(fp, "vlan_pcp=%d\n",         conf->vlan_pcp);
-    fprintf(fp, "vlan_range_end=%d\n",   conf->vlan_range_end);
-    fprintf(fp, "qinq_outer_vid=%d\n",   conf->qinq_outer_vid);
-    fprintf(fp, "payload_pattern=%d\n",  conf->payload_pattern);
-    fprintf(fp, "pfc_priority=%d\n",     conf->pfc_priority);
-    fprintf(fp, "pfc_quanta=%d\n",       conf->pfc_quanta);
-    fprintf(fp, "burst_count=%d\n",      conf->burst_count);
-    fprintf(fp, "burst_gap_ms=%d\n",     conf->burst_gap_ms);
-    fprintf(fp, "detect_failopen=%d\n",  conf->detect_failopen);
-    fprintf(fp, "sweep_enabled=%d\n",    conf->sweep_enabled);
-    fprintf(fp, "sweep_start=%d\n",      conf->sweep_start);
-    fprintf(fp, "sweep_end=%d\n",        conf->sweep_end);
-    fprintf(fp, "sweep_step=%d\n",       conf->sweep_step);
-    fprintf(fp, "sweep_hold=%d\n",       conf->sweep_hold);
+            cfg->stealth_oui[0], cfg->stealth_oui[1], cfg->stealth_oui[2]);
+    fprintf(fp, "learning=%d\n",         cfg->learning);
+    fprintf(fp, "adaptive=%d\n",         cfg->adaptive);
+    fprintf(fp, "allow_multicast=%d\n",  cfg->allow_multicast);
+    fprintf(fp, "random_client_mac=%d\n",cfg->random_client_mac);
+    fprintf(fp, "session_duration=%d\n", cfg->session_duration);
+    fprintf(fp, "nccl=%d\n",             cfg->nccl);
+    fprintf(fp, "vlan_id=%d\n",          cfg->vlan_id);
+    fprintf(fp, "vlan_pcp=%d\n",         cfg->vlan_pcp);
+    fprintf(fp, "vlan_range_end=%d\n",   cfg->vlan_range_end);
+    fprintf(fp, "qinq_outer_vid=%d\n",   cfg->qinq_outer_vid);
+    fprintf(fp, "payload_pattern=%d\n",  cfg->payload_pattern);
+    fprintf(fp, "pfc_priority=%d\n",     cfg->pfc_priority);
+    fprintf(fp, "pfc_quanta=%d\n",       cfg->pfc_quanta);
+    fprintf(fp, "burst_count=%d\n",      cfg->burst_count);
+    fprintf(fp, "burst_gap_ms=%d\n",     cfg->burst_gap_ms);
+    fprintf(fp, "detect_failopen=%d\n",  cfg->detect_failopen);
+    fprintf(fp, "sweep_enabled=%d\n",    cfg->sweep_enabled);
+    fprintf(fp, "sweep_start=%d\n",      cfg->sweep_start);
+    fprintf(fp, "sweep_end=%d\n",        cfg->sweep_end);
+    fprintf(fp, "sweep_step=%d\n",       cfg->sweep_step);
+    fprintf(fp, "sweep_hold=%d\n",       cfg->sweep_hold);
 
     fclose(fp);
     return 0;
 }
 
-int profiles_load(const char *name, struct config *conf) {
+int profiles_load(const char *name, struct config *cfg) {
     if (!profile_name_safe(name)) {
         fprintf(stderr, "profiles: unsafe profile name '%s'\n",
                 name ? name : "(null)");
@@ -166,51 +225,84 @@ int profiles_load(const char *name, struct config *conf) {
     }
 
     char line[512];
+    int  parse_err = 0;
     while (fgets(line, sizeof(line), fp)) {
-        if (line[0] == '#' || line[0] == '\n') continue;
+        rstrip(line);
+        if (line[0] == '#' || line[0] == '\0') continue;
 
         char key[64], val[256];
         if (sscanf(line, "%63[^=]=%255[^\n]", key, val) != 2) continue;
 
-        if      (strcmp(key, "interface")         == 0) { free(conf->interface); conf->interface = strdup(val); }
-        else if (strcmp(key, "mode")              == 0) conf->mode             = mode_from_string(val);
-        else if (strcmp(key, "threads")           == 0) conf->threads          = atoi(val);
-        else if (strcmp(key, "pps")               == 0) conf->pps              = atoi(val);
-        else if (strcmp(key, "packet_size")       == 0) conf->packet_size      = atoi(val);
-        else if (strcmp(key, "stealth")           == 0) conf->stealth          = atoi(val);
-        else if (strcmp(key, "stealth_oui")       == 0) {
-            unsigned int a, b, c;
-            if (sscanf(val, "%x:%x:%x", &a, &b, &c) == 3) {
-                conf->stealth_oui[0] = (uint8_t)(a & 0xFF);
-                conf->stealth_oui[1] = (uint8_t)(b & 0xFF);
-                conf->stealth_oui[2] = (uint8_t)(c & 0xFF);
+        /* macro to set a field via parse_int_field, surfacing failure. */
+        #define SETI(field, lo, hi) do {                       \
+            int v = parse_int_field(val, #field, (lo), (hi), name); \
+            if (v == INT_MIN) { parse_err = 1; }              \
+            else cfg->field = v;                              \
+        } while (0)
+
+        if      (strcmp(key, "interface")         == 0) { free(cfg->interface); cfg->interface = strdup(val); }
+        else if (strcmp(key, "mode")              == 0) {
+            flood_mode_t m = mode_from_string(val);
+            if (m == MODE_INVALID) {
+                fprintf(stderr, "profile '%s': mode='%s' is not a known mode\n",
+                        name, val);
+                parse_err = 1;
+            } else {
+                cfg->mode = m;
             }
         }
-        else if (strcmp(key, "learning")          == 0) conf->learning         = atoi(val);
-        else if (strcmp(key, "adaptive")          == 0) conf->adaptive         = atoi(val);
-        else if (strcmp(key, "allow_multicast")   == 0) conf->allow_multicast  = atoi(val);
-        else if (strcmp(key, "random_client_mac") == 0) conf->random_client_mac = atoi(val);
-        else if (strcmp(key, "session_duration")  == 0) conf->session_duration = atoi(val);
-        else if (strcmp(key, "nccl")              == 0) conf->nccl             = atoi(val);
-        else if (strcmp(key, "vlan_id")           == 0) conf->vlan_id          = atoi(val);
-        else if (strcmp(key, "vlan_pcp")          == 0) conf->vlan_pcp         = atoi(val);
-        else if (strcmp(key, "vlan_range_end")    == 0) conf->vlan_range_end   = atoi(val);
-        else if (strcmp(key, "qinq_outer_vid")    == 0) conf->qinq_outer_vid   = atoi(val);
-        else if (strcmp(key, "payload_pattern")   == 0) conf->payload_pattern  = atoi(val);
-        else if (strcmp(key, "pfc_priority")      == 0) conf->pfc_priority     = atoi(val);
-        else if (strcmp(key, "pfc_quanta")        == 0) conf->pfc_quanta       = atoi(val);
-        else if (strcmp(key, "burst_count")       == 0) conf->burst_count      = atoi(val);
-        else if (strcmp(key, "burst_gap_ms")      == 0) conf->burst_gap_ms     = atoi(val);
-        else if (strcmp(key, "detect_failopen")   == 0) conf->detect_failopen  = atoi(val);
-        else if (strcmp(key, "sweep_enabled")     == 0) conf->sweep_enabled    = atoi(val);
-        else if (strcmp(key, "sweep_start")       == 0) conf->sweep_start      = atoi(val);
-        else if (strcmp(key, "sweep_end")         == 0) conf->sweep_end        = atoi(val);
-        else if (strcmp(key, "sweep_step")        == 0) conf->sweep_step       = atoi(val);
-        else if (strcmp(key, "sweep_hold")        == 0) conf->sweep_hold       = atoi(val);
+        else if (strcmp(key, "threads")           == 0) SETI(threads, 1, MAX_THREADS);
+        else if (strcmp(key, "pps")               == 0) SETI(pps, 0, INT_MAX);
+        else if (strcmp(key, "packet_size")       == 0) {
+            int v = parse_int_field(val, "packet_size", 0, MAX_PACKET_SIZE, name);
+            if (v == INT_MIN) parse_err = 1;
+            else if (v != 0 && v < 60) {
+                fprintf(stderr, "profile '%s': packet_size=%d (must be 0 or 60..%d)\n",
+                        name, v, MAX_PACKET_SIZE);
+                parse_err = 1;
+            } else cfg->packet_size = v;
+        }
+        else if (strcmp(key, "stealth")           == 0) SETI(stealth, 0, 1);
+        else if (strcmp(key, "stealth_oui")       == 0) {
+            unsigned int a, b, c;
+            if (sscanf(val, "%x:%x:%x", &a, &b, &c) != 3 ||
+                a > 0xFF || b > 0xFF || c > 0xFF) {
+                fprintf(stderr, "profile '%s': stealth_oui='%s' must be xx:xx:xx hex\n",
+                        name, val);
+                parse_err = 1;
+            } else {
+                cfg->stealth_oui[0] = (uint8_t)a;
+                cfg->stealth_oui[1] = (uint8_t)b;
+                cfg->stealth_oui[2] = (uint8_t)c;
+            }
+        }
+        else if (strcmp(key, "learning")          == 0) SETI(learning, 0, 1);
+        else if (strcmp(key, "adaptive")          == 0) SETI(adaptive, 0, 1);
+        else if (strcmp(key, "allow_multicast")   == 0) SETI(allow_multicast, 0, 1);
+        else if (strcmp(key, "random_client_mac") == 0) SETI(random_client_mac, 0, 1);
+        else if (strcmp(key, "session_duration")  == 0) SETI(session_duration, 0, INT_MAX);
+        else if (strcmp(key, "nccl")              == 0) SETI(nccl, 0, 1);
+        else if (strcmp(key, "vlan_id")           == 0) SETI(vlan_id, 0, 4094);
+        else if (strcmp(key, "vlan_pcp")          == 0) SETI(vlan_pcp, 0, 7);
+        else if (strcmp(key, "vlan_range_end")    == 0) SETI(vlan_range_end, 0, 4094);
+        else if (strcmp(key, "qinq_outer_vid")    == 0) SETI(qinq_outer_vid, 0, 4094);
+        else if (strcmp(key, "payload_pattern")   == 0) SETI(payload_pattern, 0, 3);
+        else if (strcmp(key, "pfc_priority")      == 0) SETI(pfc_priority, 0, 7);
+        else if (strcmp(key, "pfc_quanta")        == 0) SETI(pfc_quanta, 0, 0xFFFF);
+        else if (strcmp(key, "burst_count")       == 0) SETI(burst_count, 0, INT_MAX);
+        else if (strcmp(key, "burst_gap_ms")      == 0) SETI(burst_gap_ms, 0, INT_MAX);
+        else if (strcmp(key, "detect_failopen")   == 0) SETI(detect_failopen, 0, 1);
+        else if (strcmp(key, "sweep_enabled")     == 0) SETI(sweep_enabled, 0, 1);
+        else if (strcmp(key, "sweep_start")       == 0) SETI(sweep_start, 0, INT_MAX);
+        else if (strcmp(key, "sweep_end")         == 0) SETI(sweep_end, 0, INT_MAX);
+        else if (strcmp(key, "sweep_step")        == 0) SETI(sweep_step, 0, INT_MAX);
+        else if (strcmp(key, "sweep_hold")        == 0) SETI(sweep_hold, 0, INT_MAX);
+        #undef SETI
     }
 
     fclose(fp);
-    return profile_validate(conf, name);
+    if (parse_err) return -1;
+    return profile_validate(cfg, name);
 }
 
 int profiles_list(char names[PROFILE_LIST_MAX][PROFILE_NAME_MAX]) {

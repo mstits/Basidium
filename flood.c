@@ -11,6 +11,8 @@
 
 #include <arpa/inet.h>
 #include <err.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <netinet/ip.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +20,12 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+
+#if defined(__linux__)
+#  include <sys/random.h>
+#endif
+
+uint64_t rng_base_seed = 0;
 
 /* ---- Mode helpers ---- */
 
@@ -75,24 +83,72 @@ uint64_t xorshift128plus(uint64_t s[2]) {
     return s[1] + y;
 }
 
+/*
+ * Pull a 64-bit seed from the OS entropy pool.  getrandom(2) on Linux,
+ * /dev/urandom elsewhere.  Falls back to time^pid if both fail (very unlikely
+ * — primarily so embedded builds without /dev/urandom still link).
+ */
+uint64_t entropy_seed(void) {
+    uint64_t s = 0;
+#if defined(__linux__)
+    if (getrandom(&s, sizeof(s), 0) == (ssize_t)sizeof(s) && s != 0)
+        return s;
+#endif
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        ssize_t r = read(fd, &s, sizeof(s));
+        close(fd);
+        if (r == (ssize_t)sizeof(s) && s != 0)
+            return s;
+    }
+    /* Last-ditch fallback — never zero so xorshift doesn't lock at 0. */
+    return ((uint64_t)time(NULL) << 32) ^ (uint64_t)getpid() ^ 0x9E3779B97F4A7C15ULL;
+}
+
+/*
+ * Mix a per-thread offset into the base seed so threads' streams diverge
+ * immediately.  SplitMix64-style finalizer keeps adjacent offsets from
+ * producing correlated initial outputs.
+ */
+static uint64_t mix64(uint64_t z) {
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+void rng_init_seed(struct rng_state *rng, uint64_t base, int seed_offset) {
+    if (base == 0) base = 0x9E3779B97F4A7C15ULL;
+    rng->s[0] = mix64(base + (uint64_t)seed_offset);
+    rng->s[1] = mix64(base + (uint64_t)seed_offset + 0xDEADBEEFCAFEBABEULL);
+    if (rng->s[0] == 0 && rng->s[1] == 0) rng->s[0] = 1; /* xorshift requires non-zero */
+}
+
 void rng_init(struct rng_state *rng, int seed_offset) {
-    rng->s[0] = (uint64_t)time(NULL) + seed_offset;
-    rng->s[1] = (uint64_t)getpid()  + seed_offset;
+    rng_init_seed(rng, rng_base_seed, seed_offset);
 }
 
 uint32_t rng_rand(struct rng_state *rng) {
     return (uint32_t)xorshift128plus(rng->s);
 }
 
-/* ---- IPv4 Header Checksum ---- */
+/* ---- IPv4 Header Checksum ----
+ * Uses memcpy for the 16-bit loads — `struct ip` lives at offset 14 inside a
+ * uint8_t buffer, which is 2-byte aligned in practice, but strict-alignment
+ * ARM builds can still trap on a uint16_t* dereference of a packed-struct
+ * field.  memcpy is alignment-safe and the compiler folds it to a load. */
 
 uint16_t ip_checksum(const void *data, int len) {
-    const uint16_t *p = (const uint16_t *)data;
+    if (len <= 0) return 0;
+    const uint8_t *p = (const uint8_t *)data;
     uint32_t sum = 0;
-    for (int i = 0; i < len / 2; i++)
+    int i = 0;
+    for (; i + 1 < len; i += 2) {
+        uint16_t v;
+        memcpy(&v, p + i, 2);
+        sum += v;
+    }
+    if (i < len)
         sum += p[i];
-    if (len & 1)
-        sum += ((const uint8_t *)data)[len - 1];
     while (sum >> 16)
         sum = (sum & 0xFFFF) + (sum >> 16);
     return (uint16_t)~sum;
@@ -133,9 +189,19 @@ int is_learned_mac(uint8_t *mac) {
     return 0;
 }
 
+/*
+ * Pick a pseudo-random source/dest IP.  When no -T target is configured we
+ * still want unicast space — random 32-bit values can land on 0.0.0.0,
+ * 255.255.255.255, or 224.0.0.0/4 multicast, all of which trap to switch CPU
+ * and pollute the test signal with side effects we didn't intend.  Force the
+ * top octet into 1..223 to stay in routable unicast space.
+ */
 uint32_t get_target_ip(struct rng_state *rng) {
-    if (conf.target_count == 0)
-        return rng_rand(rng);
+    if (conf.target_count == 0) {
+        uint32_t r = rng_rand(rng);
+        uint8_t  octet0 = 1 + (uint8_t)(r >> 24) % 222; /* 1..222, skips 0 + 224+ */
+        return htonl(((uint32_t)octet0 << 24) | (r & 0x00FFFFFFu));
+    }
     struct target t = conf.targets[rng_rand(rng) % conf.target_count];
     uint32_t rand_suffix = rng_rand(rng) & ~t.mask;
     return htonl(ntohl(t.ip) | rand_suffix);
@@ -153,25 +219,37 @@ void *sniffer_thread_func(void *arg) {
     }
 
     /* BPF filter: exclude our own injected traffic by filtering out frames
-     * with our probe signature in the IP ID field.  This reduces false
-     * positives in adaptive mode and makes learning more accurate. */
+     * with our probe signature in the IP ID field.  Without the filter,
+     * fail-open detection sees every injected frame come back via the
+     * loopback path that some libpcap captures expose, producing false
+     * positives.  If pcap_compile fails we treat the sniffer as broken
+     * rather than producing misleading detections. */
     struct bpf_program bpf;
     char filter[128];
     snprintf(filter, sizeof(filter),
              "not (ip and ip[4:2] = 0x%04x)", probe_signature);
-    if (pcap_compile(sniffer, &bpf, filter, 1, PCAP_NETMASK_UNKNOWN) == 0) {
-        pcap_setfilter(sniffer, &bpf);
-        pcap_freecode(&bpf);
+    if (pcap_compile(sniffer, &bpf, filter, 1, PCAP_NETMASK_UNKNOWN) != 0) {
+        warnx("Sniffer BPF compile failed: %s — disabling --detect / -L / -A",
+              pcap_geterr(sniffer));
+        pcap_close(sniffer);
+        return NULL;
     }
-    /* if compile fails, continue without filter — still functional */
+    if (pcap_setfilter(sniffer, &bpf) != 0) {
+        warnx("Sniffer BPF setfilter failed: %s", pcap_geterr(sniffer));
+        pcap_freecode(&bpf);
+        pcap_close(sniffer);
+        return NULL;
+    }
+    pcap_freecode(&bpf);
 
-    struct pcap_pkthdr hdr;
+    struct pcap_pkthdr *hdr;
     const u_char *pkt;
+    int rc;
     static const uint8_t bcast[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
 
     while (is_running) {
-        pkt = pcap_next(sniffer, &hdr);
-        if (!pkt)
+        rc = pcap_next_ex(sniffer, &hdr, &pkt);
+        if (rc <= 0)
             continue;
 
         struct ether_header_custom *eth = (struct ether_header_custom *)pkt;
@@ -190,12 +268,16 @@ void *sniffer_thread_func(void *arg) {
          * Note: with the BPF filter active, this branch only fires if the filter
          * could not be installed (pcap_compile failure). */
         if (conf.detect_failopen && !fail_open_detected &&
-                ntohs(eth->type) == ETHERTYPE_IP && hdr.caplen >= 34) {
+                ntohs(eth->type) == ETHERTYPE_IP && hdr->caplen >= 34) {
             struct ip *iph = (struct ip *)(pkt + sizeof(struct ether_header_custom));
             if (ntohs(iph->ip_id) == probe_signature) {
                 atomic_store(&fail_open_detected, 1);
                 log_event("FAIL_OPEN",
                           "Switch fail-open detected — injected frames echoed back");
+                /* --stop-on-failopen halts the run on first detection so the
+                 * operator catches it in CI/scripts instead of running to end. */
+                if (conf.stop_on_failopen)
+                    atomic_store(&is_running, 0);
             }
         }
 
@@ -283,6 +365,10 @@ int build_packet_mac(uint8_t *buffer, struct rng_state *rng) {
     if (frame_len > MAX_PACKET_SIZE)
         frame_len = MAX_PACKET_SIZE;
 
+    /* Zero before populating — the buffer is reused across iterations and
+     * across mode switches under TCO, so ip_tos / ip_off / ip_p can carry
+     * stale bytes from the previous iteration's IGMP or DHCP frame. */
+    memset(iph, 0, sizeof(*iph));
     iph->ip_hl  = 5;
     iph->ip_v   = 4;
     iph->ip_len = htons(frame_len - sizeof(struct ether_header_custom));
@@ -346,6 +432,7 @@ int build_packet_dhcp(uint8_t *buffer, struct rng_state *rng) {
     memset(eth->dest, 0xff, 6);
     eth->type = htons(ETHERTYPE_IP);
 
+    memset(iph, 0, sizeof(*iph));
     iph->ip_v   = 4;
     iph->ip_hl  = 5;
     iph->ip_ttl = 64;
@@ -467,11 +554,13 @@ int build_packet_igmp(uint8_t *buffer, struct rng_state *rng) {
     eth->type = htons(ETHERTYPE_IP);
 
     struct ip *iph = (struct ip *)(buffer + sizeof(*eth));
+    memset(iph, 0, sizeof(*iph));
     iph->ip_v   = 4;
     iph->ip_hl  = 5;
     iph->ip_tos = 0xC0;
     iph->ip_ttl = 1;
     iph->ip_p   = 2;
+    iph->ip_id  = htons(probe_signature);
     iph->ip_src.s_addr = get_target_ip(rng);
     iph->ip_dst.s_addr = group_n;
     iph->ip_len = htons((uint16_t)(sizeof(struct ip) + sizeof(struct igmp_header)));
@@ -578,6 +667,19 @@ int build_packet_pfc(uint8_t *buffer, struct rng_state *rng) {
 
 /* ---- Worker Thread ---- */
 
+static int build_for_mode(uint8_t *buf, struct rng_state *rng, flood_mode_t mode) {
+    switch (mode) {
+    case MODE_ARP:  return build_packet_arp(buf, rng);
+    case MODE_DHCP: return build_packet_dhcp(buf, rng);
+    case MODE_PFC:  return build_packet_pfc(buf, rng);
+    case MODE_ND:   return build_packet_nd(buf, rng);
+    case MODE_LLDP: return build_packet_lldp(buf, rng);
+    case MODE_STP:  return build_packet_stp(buf, rng);
+    case MODE_IGMP: return build_packet_igmp(buf, rng);
+    default:        return build_packet_mac(buf, rng);
+    }
+}
+
 void *worker_func(void *arg) {
     int thread_id = *(int *)arg;
     char errbuf[PCAP_ERRBUF_SIZE];
@@ -597,26 +699,16 @@ void *worker_func(void *arg) {
     struct rng_state rng;
     rng_init(&rng, thread_id);
 
-    /* Build initial template */
-    switch (conf.mode) {
-    case MODE_ARP:  len = build_packet_arp(buffer, &rng);  break;
-    case MODE_DHCP: len = build_packet_dhcp(buffer, &rng); break;
-    case MODE_PFC:  len = build_packet_pfc(buffer, &rng);  break;
-    case MODE_ND:   len = build_packet_nd(buffer, &rng);   break;
-    case MODE_LLDP: len = build_packet_lldp(buffer, &rng); break;
-    case MODE_STP:  len = build_packet_stp(buffer, &rng);  break;
-    case MODE_IGMP: len = build_packet_igmp(buffer, &rng); break;
-    default:        len = build_packet_mac(buffer, &rng);  break;
-    }
+    flood_mode_t cur_mode = conf.mode;
+    len = build_for_mode(buffer, &rng, cur_mode);
 
     struct ether_header_custom *eth = (struct ether_header_custom *)buffer;
     uint64_t local_sent       = 0;
     int      inject_failures  = 0;
     /* fast path eligible: mode 0, no stealth/learning/targeting/VLAN-range.
-     * Also disabled when a TCO scenario is active: mode switches corrupt the
-     * template buffer (ether_type, payload), and the fast path only overwrites
-     * the 12 MAC bytes.  Switching MAC→PFC→MAC would leave stale PFC data.
-     * We also re-check conf.mode at runtime as a safety net. */
+     * Also disabled when a TCO scenario is active: mode switches require a
+     * full template rebuild and the fast path only overwrites the 12 MAC
+     * bytes.  We re-check conf.mode each iteration as a safety net. */
     int fast_mac_eligible = (!conf.scenario_file &&
                              !conf.learning && !conf.stealth &&
                              conf.target_count == 0 &&
@@ -630,6 +722,14 @@ void *worker_func(void *arg) {
 
     uint64_t burst_local = 0;
 
+    /* Token-bucket rate limiter: replaces the broken per-1024 usleep math
+     * (which rounded to 0 above ~1Mpps and over-shot below ~10kpps).  We
+     * compute the absolute time the next packet is allowed and clock_nanosleep
+     * until then.  Per-thread quota is the global PPS divided by thread count. */
+    struct timespec next_tx;
+    clock_gettime(CLOCK_MONOTONIC, &next_tx);
+    int last_pps_seen = 0;
+
     while (is_running) {
         if (conf.count > 0 && (unsigned long long)total_sent >= (unsigned long long)conf.count)
             break;
@@ -637,34 +737,37 @@ void *worker_func(void *arg) {
         while (is_paused && is_running)
             usleep(50000);
 
+        /* Detect runtime mode switch (TCO scenarios change conf.mode while
+         * workers run).  When it changes we wipe the buffer and rebuild from
+         * scratch — keeps the fast-path optimization safe and prevents stale
+         * builder bytes from leaking into the new mode's frame. */
+        flood_mode_t live_mode = conf.mode;
+        if (live_mode != cur_mode) {
+            memset(buffer, 0, MAX_PACKET_SIZE);
+            cur_mode = live_mode;
+            len = build_for_mode(buffer, &rng, cur_mode);
+        }
+
         /* ---- Fast Path ---- */
-        if (fast_mac_eligible && conf.mode == MODE_MAC) {
+        if (fast_mac_eligible && cur_mode == MODE_MAC) {
             uint64_t r1 = xorshift128plus(rng.s);
             uint64_t r2 = xorshift128plus(rng.s);
 
-            uint8_t *src_ptr = eth->source;
-            uint8_t *dst_ptr = eth->dest;
+            uint8_t mac6[6];
+            mac6[0] = (uint8_t)r1;       mac6[1] = (uint8_t)(r1 >> 8);
+            mac6[2] = (uint8_t)(r1 >> 16); mac6[3] = (uint8_t)(r1 >> 24);
+            mac6[4] = (uint8_t)(r1 >> 32); mac6[5] = (uint8_t)(r1 >> 40);
+            if (!conf.allow_multicast) mac6[0] &= 0xfe;
+            memcpy(eth->source, mac6, 6);
 
-            *(uint32_t *)src_ptr        = (uint32_t)r1;
-            *(uint16_t *)(src_ptr + 4)  = (uint16_t)(r1 >> 32);
-            if (!conf.allow_multicast)
-                src_ptr[0] &= 0xfe;
-
-            *(uint32_t *)dst_ptr        = (uint32_t)r2;
-            *(uint16_t *)(dst_ptr + 4)  = (uint16_t)(r2 >> 32);
+            mac6[0] = (uint8_t)r2;       mac6[1] = (uint8_t)(r2 >> 8);
+            mac6[2] = (uint8_t)(r2 >> 16); mac6[3] = (uint8_t)(r2 >> 24);
+            mac6[4] = (uint8_t)(r2 >> 32); mac6[5] = (uint8_t)(r2 >> 40);
+            memcpy(eth->dest, mac6, 6);
         }
         /* ---- Slow Path ---- */
         else {
-            switch (conf.mode) {
-            case MODE_ARP:  len = build_packet_arp(buffer, &rng);  break;
-            case MODE_DHCP: len = build_packet_dhcp(buffer, &rng); break;
-            case MODE_PFC:  len = build_packet_pfc(buffer, &rng);  break;
-            case MODE_ND:   len = build_packet_nd(buffer, &rng);   break;
-            case MODE_LLDP: len = build_packet_lldp(buffer, &rng); break;
-            case MODE_STP:  len = build_packet_stp(buffer, &rng);  break;
-            case MODE_IGMP: len = build_packet_igmp(buffer, &rng); break;
-            default:        len = build_packet_mac(buffer, &rng);  break;
-            }
+            len = build_for_mode(buffer, &rng, cur_mode);
         }
 
         /* Send */
@@ -675,7 +778,7 @@ void *worker_func(void *arg) {
             pcap_dump((u_char *)global_pd, &pkthdr, buffer);
             local_sent++;
             inject_failures = 0;
-        } else if (pcap_inject(inj, buffer, len) > 0) {
+        } else if (pcap_inject(inj, buffer, len) >= len) {
             local_sent++;
             inject_failures = 0;
         } else {
@@ -701,27 +804,76 @@ void *worker_func(void *arg) {
             }
         }
 
-        /* Batch-update globals every 1024 packets */
-        if ((local_sent & 1023) == 0) {
+        /* Per-packet pacing.  Recompute interval on conf.pps changes (sweep
+         * walks PPS up; TCO writes per-step PPS).  We track the absolute
+         * next-tx time on CLOCK_MONOTONIC and sleep the delta with nanosleep —
+         * portable to macOS/BSD where clock_nanosleep TIMER_ABSTIME is not
+         * universally available.  If we're already late, skip the sleep so
+         * the rate catches up rather than running indefinitely behind. */
+        int cur_pps = conf.pps;
+        if (cur_pps > 0 && conf.burst_count == 0) {
+            if (cur_pps != last_pps_seen) {
+                clock_gettime(CLOCK_MONOTONIC, &next_tx);
+                last_pps_seen = cur_pps;
+            }
+            uint64_t per_thread_pps = (uint64_t)cur_pps / (uint64_t)conf.threads;
+            if (per_thread_pps == 0) per_thread_pps = 1;
+            uint64_t ns = 1000000000ULL / per_thread_pps;
+            next_tx.tv_nsec += (long)ns;
+            while (next_tx.tv_nsec >= 1000000000L) {
+                next_tx.tv_nsec -= 1000000000L;
+                next_tx.tv_sec  += 1;
+            }
+            struct timespec now, delta;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            delta.tv_sec  = next_tx.tv_sec  - now.tv_sec;
+            delta.tv_nsec = next_tx.tv_nsec - now.tv_nsec;
+            if (delta.tv_nsec < 0) {
+                delta.tv_sec  -= 1;
+                delta.tv_nsec += 1000000000L;
+            }
+            if (delta.tv_sec >= 0 && (delta.tv_sec > 0 || delta.tv_nsec > 0))
+                nanosleep(&delta, NULL);
+            else
+                next_tx = now; /* fell behind — resync, don't accumulate debt */
+        }
+
+        /* Counter bookkeeping.
+         *
+         * Unbounded run (conf.count == 0): amortize atomic contention by
+         * flushing in batches of 1024 — at multi-Mpps with N workers, the
+         * cache-line ping-pong on `total_sent` would otherwise dominate.
+         *
+         * Bounded run (conf.count > 0): flush per packet so the break
+         * condition fires within one packet of the target.  The atomic
+         * traffic is bounded by `count` itself, so contention cost is
+         * irrelevant.  Without this branch, `-n 3` overshot to ~1024
+         * because the loop never noticed it had reached the limit. */
+        if (conf.count > 0) {
+            atomic_fetch_add(&total_sent, 1);
+            atomic_fetch_add(&thread_sent[thread_id], 1);
+        } else if (local_sent > 0 && (local_sent & 1023) == 0) {
             atomic_fetch_add(&total_sent, 1024);
             atomic_fetch_add(&thread_sent[thread_id], 1024);
+        }
 
-            if (conf.pps > 0 && conf.burst_count == 0)
-                usleep((1024 * 1000000ULL / conf.pps) * conf.threads);
-
-            if (conf.adaptive) {
-                unsigned long long cur_bcast = (unsigned long long)bcast_rx;
-                if (cur_bcast - last_bcast_rx > 2048)
-                    usleep(5000);
-                last_bcast_rx = cur_bcast;
-            }
+        /* Adaptive throttle check is independent of the count gate and stays
+         * batched — broadcast rate is a slow-moving signal. */
+        if (conf.adaptive && local_sent > 0 && (local_sent & 1023) == 0) {
+            unsigned long long cur_bcast = (unsigned long long)bcast_rx;
+            if (cur_bcast - last_bcast_rx > 2048)
+                usleep(5000);
+            last_bcast_rx = cur_bcast;
         }
     }
 
-    /* Flush residual to BOTH counters */
-    uint64_t residual = local_sent % 1024;
-    atomic_fetch_add(&total_sent, residual);
-    atomic_fetch_add(&thread_sent[thread_id], residual);
+    /* Residual flush only matters when we batched (count == 0); bounded
+     * runs already emitted per-packet. */
+    if (conf.count == 0) {
+        uint64_t residual = local_sent % 1024;
+        atomic_fetch_add(&total_sent, residual);
+        atomic_fetch_add(&thread_sent[thread_id], residual);
+    }
 
     if (inj)
         pcap_close(inj);
@@ -755,8 +907,9 @@ void *pcap_replay_func(void *arg) {
         if (rc == 0) continue;
         pcap_inject(inj, data, hdr->caplen);
         atomic_fetch_add(&total_sent, 1);
-        if (conf.pps > 0)
-            usleep(1000000 / conf.pps);
+        int cur_pps = conf.pps;
+        if (cur_pps > 0)
+            usleep(1000000u / (unsigned)cur_pps);
     }
 
     pcap_close(inj);
@@ -851,6 +1004,22 @@ void *sweep_thread_func(void *arg) {
                 /* Set baseline from first successful measurement */
                 if (nccl.baseline_bus_bw <= 0.0)
                     nccl_set_baseline();
+
+                /* --stop-on-degradation halts the sweep when bandwidth drops
+                 * past the operator's threshold (negative percent, e.g. -30
+                 * means stop at 30% degradation).  Useful in CI to fail fast
+                 * on regressions. */
+                if (conf.stop_on_degradation_pct < 0.0 &&
+                        nccl.baseline_bus_bw > 0.0) {
+                    double delta = ((sweep_step_nccl_busbw[step]
+                                     - nccl.baseline_bus_bw)
+                                    / nccl.baseline_bus_bw) * 100.0;
+                    if (delta <= conf.stop_on_degradation_pct) {
+                        log_event("SWEEP_STOP",
+                                  "stop-on-degradation threshold reached");
+                        atomic_store(&is_running, 0);
+                    }
+                }
             }
         }
 

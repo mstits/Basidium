@@ -7,8 +7,10 @@
 #ifndef FLOOD_H
 #define FLOOD_H
 
+#include <assert.h>
 #include <pcap.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <time.h>
@@ -41,8 +43,10 @@ flood_mode_t mode_from_string(const char *str);
 /* ---- fast RNG (Xorshift128+) ---- */
 struct rng_state { uint64_t s[2]; };
 void rng_init(struct rng_state *rng, int seed_offset);
+void rng_init_seed(struct rng_state *rng, uint64_t base, int seed_offset);
 uint64_t xorshift128plus(uint64_t s[2]);
 uint32_t rng_rand(struct rng_state *rng);  /* drop-in rand() replacement */
+uint64_t entropy_seed(void);               /* getrandom()/urandom or fallback */
 
 /* ---- ethertypes ---- */
 #define ETHERTYPE_IP    0x0800
@@ -52,14 +56,19 @@ uint32_t rng_rand(struct rng_state *rng);  /* drop-in rand() replacement */
 #define ETHERTYPE_LLDP  0x88CC  /* Link Layer Discovery Protocol */
 #define ETHERTYPE_8021AD 0x88A8 /* 802.1ad QinQ outer TPID */
 
-/* ---- portable header structs ---- */
-struct ether_header_custom {
+/* ---- portable wire-format header structs ----
+ * Every struct that maps to bytes-on-wire is __attribute__((packed)) so the
+ * compiler does not insert padding between fields.  static_assert below pins
+ * the byte layout so a hostile ABI change fails the build instead of silently
+ * shipping malformed frames. */
+struct __attribute__((packed)) ether_header_custom {
     uint8_t  dest[ETHER_ADDR_LEN];
     uint8_t  source[ETHER_ADDR_LEN];
     uint16_t type;
 };
+_Static_assert(sizeof(struct ether_header_custom) == 14, "ether_header size");
 
-struct arp_header {
+struct __attribute__((packed)) arp_header {
     uint16_t htype;
     uint16_t ptype;
     uint8_t  hlen;
@@ -70,15 +79,17 @@ struct arp_header {
     uint8_t  tha[6];
     uint32_t tpa;
 };
+_Static_assert(sizeof(struct arp_header) == 28, "arp_header size");
 
-struct udp_header {
+struct __attribute__((packed)) udp_header {
     uint16_t src_port;
     uint16_t dst_port;
     uint16_t len;
     uint16_t check;
 };
+_Static_assert(sizeof(struct udp_header) == 8, "udp_header size");
 
-struct dhcp_packet {
+struct __attribute__((packed)) dhcp_packet {
     uint8_t  op;
     uint8_t  htype;
     uint8_t  hlen;
@@ -96,6 +107,7 @@ struct dhcp_packet {
     uint32_t magic_cookie;
     uint8_t  options[308];
 };
+_Static_assert(sizeof(struct dhcp_packet) == 548, "dhcp_packet size");
 
 struct target {
     uint32_t ip;
@@ -104,17 +116,18 @@ struct target {
 
 /* ---- IPv6 / ICMPv6 structs (for ND flood mode) ---- */
 
-struct ipv6_header {
+struct __attribute__((packed)) ipv6_header {
     uint32_t vcf;           /* version(4b) | traffic-class(8b) | flow-label(20b) */
     uint16_t payload_len;
     uint8_t  next_header;   /* 58 = ICMPv6 */
     uint8_t  hop_limit;
     uint8_t  src[16];
     uint8_t  dst[16];
-};                          /* 40 bytes */
+};
+_Static_assert(sizeof(struct ipv6_header) == 40, "ipv6_header size");
 
 /* ICMPv6 Neighbor Solicitation + Source Link-Layer Address option */
-struct icmpv6_ns_pkt {
+struct __attribute__((packed)) icmpv6_ns_pkt {
     uint8_t  type;          /* 135 */
     uint8_t  code;          /* 0 */
     uint16_t checksum;      /* 0 — not computed; switches forward regardless */
@@ -123,21 +136,31 @@ struct icmpv6_ns_pkt {
     uint8_t  opt_type;      /* 1 = Source Link-Layer Address */
     uint8_t  opt_len;       /* 1 (units of 8 bytes) */
     uint8_t  opt_mac[6];    /* source MAC */
-};                          /* 32 bytes */
+};
+_Static_assert(sizeof(struct icmpv6_ns_pkt) == 32, "icmpv6_ns_pkt size");
 
-struct igmp_header {
+struct __attribute__((packed)) igmp_header {
     uint8_t  type;
     uint8_t  max_resp;
     uint16_t checksum;
     uint32_t group;
 };
+_Static_assert(sizeof(struct igmp_header) == 8, "igmp_header size");
 
+/*
+ * Runtime-mutable fields.  pps and mode are written by sweep_thread_func and
+ * tco_thread_func while workers read them every iteration; declaring them
+ * _Atomic gives correct seq_cst semantics under C11 plain assignment, so
+ * existing `conf.mode = X` / `conf.pps == Y` reads still compile but no longer
+ * race.  Other fields are set once at startup and never mutated, so they need
+ * no qualification.
+ */
 struct config {
-    char        *interface;
-    int          count;
-    int          pps;
-    int          threads;
-    flood_mode_t mode;
+    char                *interface;
+    int                  count;
+    _Atomic int          pps;
+    int                  threads;
+    _Atomic flood_mode_t mode;
     int      stealth;
     uint8_t  stealth_oui[3];
     int      learning;
@@ -177,11 +200,21 @@ struct config {
     int      payload_pattern;  /* --payload: 0=zeros(default), 1=ff, 2=dead, 3=incr */
     int      dry_run;          /* --dry-run: build & count packets without injecting */
     char    *scenario_file;    /* --scenario: TCO scenario file path */
+    /* v2.5 quick-win flags */
+    uint64_t rng_seed;         /* --seed: deterministic RNG seed (0 = entropy) */
+    int      seed_set;         /* 1 if --seed was passed */
+    int      ndjson;           /* --ndjson: line-oriented status to stdout */
+    int      report_compact;   /* --report-compact: single-line JSON */
+    char    *csv_path;         /* --csv: path for CSV emit */
+    int      stop_on_failopen; /* --stop-on-failopen: halt run when triggered */
+    double   stop_on_degradation_pct; /* --stop-on-degradation N: halt at -N% */
+    int      no_color;         /* derived from $NO_COLOR / TERM=dumb */
 };
 
 /* ---- shared state (defined in basidium.c) ---- */
 extern struct config     conf;
 extern atomic_ullong     total_sent;
+extern volatile sig_atomic_t signal_stop; /* set by signal handler — async-safe */
 extern atomic_int        is_running;
 extern atomic_int        is_paused;
 extern atomic_int        is_started;     /* TUI: set to 1 when user presses start */
@@ -209,6 +242,7 @@ extern struct nic_stats   sweep_step_nic_delta[MAX_SWEEP_STEPS]; /* NIC counter 
 extern int                sweep_step_nic_valid[MAX_SWEEP_STEPS]; /* 1 if nic delta was computed */
 
 /* ---- flood.c prototypes ---- */
+extern uint64_t rng_base_seed;          /* set by --seed or entropy at startup */
 void     log_event(const char *type, const char *msg);
 void     randomize_mac(uint8_t *mac, struct rng_state *rng);
 int      is_learned_mac(uint8_t *mac);

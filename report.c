@@ -24,6 +24,9 @@ static void write_esc(FILE *fp, const char *s) {
         if      (*s == '"')  fputs("\\\"", fp);
         else if (*s == '\\') fputs("\\\\", fp);
         else if (*s == '\n') fputs("\\n",  fp);
+        else if (*s == '\r') fputs("\\r",  fp);
+        else if (*s == '\t') fputs("\\t",  fp);
+        else if ((unsigned char)*s < 0x20) fprintf(fp, "\\u%04x", (unsigned char)*s);
         else                 fputc(*s, fp);
     }
     fputc('"', fp);
@@ -229,6 +232,150 @@ int write_report(const char *path, const struct nic_stats *final_nic) {
         return -1;
     }
 
-    printf("Report written to: %s\n", path);
+    /* --report-compact: post-process the pretty JSON we just wrote into a
+     * single line.  We strip leading whitespace and newlines outside string
+     * literals — quoted strings (which we already escape \\n/\\r in
+     * write_esc) survive intact.  Cheaper than threading a "compact" flag
+     * through every fprintf in this function. */
+    if (conf.report_compact) {
+        FILE *rp = fopen(path, "r");
+        if (!rp) {
+            fprintf(stderr, "report: reopen for compact failed: %s\n",
+                    strerror(errno));
+            return -1;
+        }
+        if (fseek(rp, 0, SEEK_END) != 0) { fclose(rp); return -1; }
+        long sz = ftell(rp);
+        if (sz < 0 || sz > 16 * 1024 * 1024) {
+            fclose(rp);
+            fprintf(stderr, "report: implausible size for compact: %ld\n", sz);
+            return -1;
+        }
+        rewind(rp);
+        char *buf = malloc((size_t)sz + 1);
+        if (!buf) { fclose(rp); return -1; }
+        size_t rr = fread(buf, 1, (size_t)sz, rp);
+        buf[rr] = '\0';
+        fclose(rp);
+
+        FILE *wp = fopen(path, "w");
+        if (!wp) { free(buf); return -1; }
+        int in_str = 0, prev_bs = 0;
+        for (size_t i = 0; i < rr; i++) {
+            char c = buf[i];
+            if (in_str) {
+                fputc(c, wp);
+                if (c == '\\' && !prev_bs) prev_bs = 1;
+                else { if (c == '"' && !prev_bs) in_str = 0; prev_bs = 0; }
+            } else {
+                if (c == '"') { in_str = 1; fputc(c, wp); }
+                else if (c == '\n' || c == '\r' || c == '\t') { /* drop */ }
+                else if (c == ' ') {
+                    /* squash runs of spaces between tokens to nothing */
+                }
+                else fputc(c, wp);
+            }
+        }
+        free(buf);
+        if (fclose(wp) != 0) {
+            fprintf(stderr, "report: compact rewrite close failed\n");
+            return -1;
+        }
+    }
+
+    if (!conf.ndjson)
+        printf("Report written to: %s\n", path);
+    return 0;
+}
+
+/* ---- CSV emit ---- */
+
+int write_csv(const char *path) {
+    FILE *fp = fopen(path, "w");
+    if (!fp) {
+        fprintf(stderr, "csv: cannot open %s for writing: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+
+    fprintf(fp, "step,mode,pps_target,pps_achieved,nccl_busbw,"
+                "nccl_degradation_pct,nic_tx_packets,nic_tx_dropped,nic_tx_errors\n");
+
+    int wrote = 0;
+
+    /* Sweep steps share a single mode (conf.mode) — write that on every row
+     * so a CSV viewer can group/filter without inferring it from the report. */
+    if (conf.sweep_enabled && (int)sweep_total_steps > 0) {
+        int nsteps = (int)sweep_total_steps;
+        int pps = conf.sweep_start;
+        for (int i = 0; i < nsteps; i++, pps += conf.sweep_step) {
+            fprintf(fp, "%d,%s,%d,%llu,",
+                    i + 1, mode_to_string(conf.mode), pps,
+                    sweep_step_pps[i]);
+            if (sweep_step_nccl_valid[i]) {
+                fprintf(fp, "%.2f,", sweep_step_nccl_busbw[i]);
+                if (nccl.baseline_bus_bw > 0.0)
+                    fprintf(fp, "%.1f,",
+                            ((sweep_step_nccl_busbw[i] - nccl.baseline_bus_bw)
+                             / nccl.baseline_bus_bw) * 100.0);
+                else
+                    fputs(",", fp);
+            } else {
+                fputs(",,", fp);
+            }
+            if (sweep_step_nic_valid[i])
+                fprintf(fp, "%llu,%llu,%llu",
+                        (unsigned long long)sweep_step_nic_delta[i].tx_packets,
+                        (unsigned long long)sweep_step_nic_delta[i].tx_dropped,
+                        (unsigned long long)sweep_step_nic_delta[i].tx_errors);
+            else
+                fputs(",,", fp);
+            fputs("\n", fp);
+            wrote++;
+        }
+    }
+
+    /* Scenario steps each carry their own mode. */
+    if (conf.scenario_file && tco_scenario.step_count > 0) {
+        for (int i = 0; i < tco_scenario.step_count; i++) {
+            struct tco_step *st = &tco_scenario.steps[i];
+            fprintf(fp, "%d,%s,%d,%llu,",
+                    i + 1, mode_to_string(st->mode), st->pps,
+                    tco_results[i].achieved_pps);
+            if (tco_results[i].nccl_valid) {
+                fprintf(fp, "%.2f,", tco_results[i].nccl_busbw);
+                if (nccl.baseline_bus_bw > 0.0)
+                    fprintf(fp, "%.1f,",
+                            ((tco_results[i].nccl_busbw - nccl.baseline_bus_bw)
+                             / nccl.baseline_bus_bw) * 100.0);
+                else
+                    fputs(",", fp);
+            } else {
+                fputs(",,", fp);
+            }
+            if (tco_results[i].nic_valid)
+                fprintf(fp, "%llu,%llu,%llu",
+                        (unsigned long long)tco_results[i].nic_delta.tx_packets,
+                        (unsigned long long)tco_results[i].nic_delta.tx_dropped,
+                        (unsigned long long)tco_results[i].nic_delta.tx_errors);
+            else
+                fputs(",,", fp);
+            fputs("\n", fp);
+            wrote++;
+        }
+    }
+
+    int werr = ferror(fp);
+    int cerr = (fclose(fp) != 0);
+    if (werr || cerr) {
+        fprintf(stderr, "csv: write to %s failed — file removed\n", path);
+        unlink(path);
+        return -1;
+    }
+
+    if (wrote == 0)
+        fprintf(stderr, "csv: %s — no sweep or scenario steps to emit\n", path);
+    else if (!conf.ndjson)
+        printf("CSV written to: %s (%d rows)\n", path, wrote);
     return 0;
 }

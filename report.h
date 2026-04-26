@@ -24,4 +24,13 @@
  */
 int write_report(const char *path, const struct nic_stats *final_nic);
 
+/*
+ * Write sweep/scenario steps as CSV to `path`.  Returns 0 on success, -1 on
+ * any I/O failure.  Header row is fixed:
+ *   step,mode,pps_target,pps_achieved,nccl_busbw,nccl_degradation_pct,
+ *   nic_tx_packets,nic_tx_dropped,nic_tx_errors
+ * Empty cells are written as blank, not "null".
+ */
+int write_csv(const char *path);
+
 #endif /* REPORT_H */
