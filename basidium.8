@@ -232,7 +232,7 @@ and estimating packet builder throughput.
 .TP
 .B \-\-validate \fIfile.tco\fR
 Parse a scenario file and exit 0 if valid, 1 with a line-numbered
-diagnostic otherwise. Suitable for CI lints.
+diagnostic otherwise. Suitable for pre-merge lints.
 .TP
 .B \-\-print\-config
 Print the merged effective config (defaults + profile + flags) as
@@ -332,7 +332,7 @@ NCCL-correlated sweep that fails fast on a 30% drop:
 .B sudo basidium -i eth0 --sweep 1000:50000:5000:30 --nccl --stop-on-degradation 30 --report
 .RE
 .PP
-Validate every example scenario in a CI gate:
+Validate every example scenario in a scripted gate:
 .RS
 .B for f in examples/*.tco; do basidium --validate "$f" || exit 1; done
 .RE

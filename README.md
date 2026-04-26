@@ -4,7 +4,6 @@
 
 <img width="709" height="497" alt="Basidium Screenshot" src="https://github.com/user-attachments/assets/1fe90db9-669f-4a5e-9c48-4ea22cd53733" />
 
-[![Build](https://github.com/mstits/Basidium/actions/workflows/build.yml/badge.svg)](https://github.com/mstits/Basidium/actions/workflows/build.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 ---
@@ -31,7 +30,7 @@ In a GPU cluster, **the network fabric is the basidium**. The models get the hea
   `--seed` for bit-reproducible regression hunts.
 - **`--stop-on-degradation N` / `--stop-on-failopen`** — halt sweeps and
   scenarios the moment a regression or fail-open is detected. Exits 2,
-  scriptable for CI gating.
+  scriptable for fail-fast gates.
 - **`--validate scenario.tco`, `--print-config`, `--list-modes`,
   `--list-profiles`** — quality-of-life diagnostics for shell scripting and
   debugging silently-merged profile loads.
@@ -42,8 +41,9 @@ In a GPU cluster, **the network fabric is the basidium**. The models get the hea
   `-T 10.0.0.0/40`, `-S 00:11`, `--duration 5x` now error out instead of
   corrupting state), `sigaction` + SIGPIPE-ignore, OS-entropy RNG seeding,
   proper `clock_gettime`-based per-packet rate limiter.
-- **CI** runs ASan + UBSan, validates every `examples/*.tco`, and
-  `mandoc -Tlint`s the man page.
+- **`make test`** — exhaustive offline test runner (~127 assertions);
+  `make asan` / `make tsan` for sanitizer rebuilds; `make check` validates
+  every shipped scenario; the man page lints clean with `mandoc -Tlint`.
 - **Bash completion** in `contrib/basidium.bash`.
 
 ### Core Capabilities
@@ -67,7 +67,7 @@ graph LR
     end
 
     subgraph "Regression Detection"
-        STOP["--stop-on-degradation<br/>--stop-on-failopen<br/>halt + exit 2 in CI"]
+        STOP["--stop-on-degradation<br/>--stop-on-failopen<br/>halt + exit 2"]
         DIFF["--diff baseline.json today.json<br/>step-by-step pps + busbw delta"]
     end
 
@@ -84,7 +84,7 @@ graph LR
 - **Rate Sweeps:** Generate precise rate sweeps with JSON reporting to establish forwarding capacity baselines and detect regressions over time.
 - **NCCL Co-Validation:** Run injection patterns simultaneously with NCCL collective tests to observe how Layer-2 stress conditions measurably affect application-layer throughput. This side-by-side view helps isolate whether a performance problem originates in the fabric or the software stack.
 - **Targeted Congestion Orchestration (TCO):** Define multi-step, multi-mode congestion scenarios (`.tco` files) that switch between flood modes at runtime while measuring NCCL degradation at each step.
-- **Regression Detection:** Identify performance drift caused by firmware updates, configuration changes, physical layer degradation, or incremental topology changes. `--seed` makes runs bit-reproducible; `--diff` compares two reports step-by-step and exits 2 on threshold breach; `--stop-on-degradation` and `--stop-on-failopen` halt mid-run for fail-fast CI.
+- **Regression Detection:** Identify performance drift caused by firmware updates, configuration changes, physical layer degradation, or incremental topology changes. `--seed` makes runs bit-reproducible; `--diff` compares two reports step-by-step and exits 2 on threshold breach; `--stop-on-degradation` and `--stop-on-failopen` halt mid-run for fail-fast scripting.
 
 > **Authorization required.** Use only on airgapped hardware you own or have explicit written permission to test. Never run against production infrastructure or equipment belonging to others.
 >
@@ -223,7 +223,7 @@ graph TB
         REPORT_F["JSON / CSV report"]
     end
 
-    subgraph "CI / Regression Detection"
+    subgraph "Regression Detection"
         BASE["baseline.json<br/>(captured pre-change)"]
         DIFF["basidium --diff<br/>baseline.json today.json"]
         VERDICT{"exit code"}
@@ -237,8 +237,8 @@ graph TB
     BASE --> DIFF
     REPORT_F --> |"today.json"| DIFF
     DIFF --> VERDICT
-    VERDICT --> |"0 = OK"| OK["merge PR / promote build"]
-    VERDICT --> |"2 = regression"| FAIL["fail CI / page oncall"]
+    VERDICT --> |"0 = OK"| OK["promote build"]
+    VERDICT --> |"2 = regression"| FAIL["fail the gate / alert"]
 
     style B fill:#2d6,stroke:#000,color:#fff
     style TOR1 fill:#f96,stroke:#000
@@ -252,7 +252,7 @@ graph TB
 ## Building
 
 **Dependencies:** `libpcap-dev`, `libncurses-dev` (TUI only), `gcc`, `make`,
-`python3` + `bash` (for `make test` only), `mandoc` (for man-page lint in CI only)
+`python3` + `bash` (for `make test` only), `mandoc` (optional, for man-page lint)
 
 ```sh
 # CLI only
@@ -324,7 +324,7 @@ sudo ./basidium -i eth0 --sweep 1000:50000:5000:30 --nccl --report=baseline.json
 sudo ./basidium -i eth0 --sweep 1000:50000:5000:30 --nccl --report=today.json --seed 42
 basidium --diff baseline.json today.json --diff-threshold-busbw -10
 
-# ---- Fail-fast in CI ----
+# ---- Fail-fast scripted gate ----
 sudo ./basidium -i eth0 --scenario examples/pfc-recovery.tco --nccl \
     --stop-on-degradation 30 --stop-on-failopen --report=ci.json
 # Exit 2 means regression — fail the job.
@@ -420,7 +420,7 @@ Ramps injection rate from `start` to `end` PPS in `step` increments, holding eac
 | `--profile <name>` | Load `~/.basidium/<name>.conf` (also honors `$XDG_CONFIG_HOME` and `$BASIDIUM_PROFILE_DIR`) |
 | `--duration <time>` | Auto-stop: `30`, `5m`, `2h`, `1d` |
 
-### Stop Conditions (Fail-Fast for CI)
+### Stop Conditions (Fail-Fast Gates)
 | Flag | Description |
 |------|-------------|
 | `--stop-on-failopen` | Halt run on first fail-open detection (exit 2) |
@@ -787,7 +787,7 @@ flowchart LR
     B2 -->|"today.json"| D
     D --> R{"step delta<br/>vs threshold"}
     R -->|"all within threshold"| OK["exit 0<br/>(merge / promote)"]
-    R -->|"any breach"| FAIL["exit 2<br/>(fail CI / page)"]
+    R -->|"any breach"| FAIL["exit 2<br/>(fail the gate)"]
 
     style D fill:#369,stroke:#000,color:#fff
     style FAIL fill:#c33,stroke:#000,color:#fff
@@ -819,7 +819,7 @@ both mean "stop at 30% drop"), the run halts and exits 2 immediately.
 `--stop-on-failopen` does the same on the first echoed probe frame.
 
 ```sh
-# Fail-fast CI: halt at 30% NCCL drop OR first fail-open detection
+# Fail-fast gate: halt at 30% NCCL drop OR first fail-open detection
 sudo ./basidium -i eth0 --scenario qual.tco --nccl --seed 42 \
     --stop-on-degradation 30 --stop-on-failopen --report=ci.json
 # Exit 2 means regression — fail the job.
@@ -922,9 +922,9 @@ diff.c/.h           --diff regression detection: parse two reports, compare
                     pps_achieved + nccl_busbw step-by-step, exit 2 on breach
 contrib/
     basidium.bash   bash completion (modes, flags, scenario files, profiles)
-examples/*.tco      shipped scenarios (validated in CI via --validate)
+examples/*.tco      shipped scenarios (validated by `make check` via --validate)
 tests/run-all.sh    exhaustive offline test suite (~125 assertions)
-basidium.8          man page (linted with mandoc -Tlint in CI)
+basidium.8          man page (lints clean with `mandoc -Tlint`)
 ```
 
 ### Fast Path
@@ -933,7 +933,7 @@ In MAC flood mode without stealth, learning, or VLAN-range active, workers use X
 
 ### Thread Safety
 
-All packet builders accept a per-thread `struct rng_state *` parameter. No global `rand()` calls occur in worker threads. Each thread initializes its own xorshift128+ state from a base seed (entropy or `--seed N`) mixed through SplitMix64 with a per-thread offset, so adjacent threads do not produce correlated streams. `conf.mode` and `conf.pps` are `_Atomic`-qualified, giving sweep/TCO-to-worker writes seq_cst semantics without changing call-site syntax. ASan + UBSan + TSan all run clean in CI.
+All packet builders accept a per-thread `struct rng_state *` parameter. No global `rand()` calls occur in worker threads. Each thread initializes its own xorshift128+ state from a base seed (entropy or `--seed N`) mixed through SplitMix64 with a per-thread offset, so adjacent threads do not produce correlated streams. `conf.mode` and `conf.pps` are `_Atomic`-qualified, giving sweep/TCO-to-worker writes seq_cst semantics without changing call-site syntax. `make asan` + `make tsan` rebuilds run the selftest cleanly on every release.
 
 ---
 
@@ -945,7 +945,7 @@ All packet builders accept a per-thread `struct rng_state *` parameter. No globa
 | libpthread | standard | standard | standard |
 | libncurses | `libncurses-dev` | `ncurses-devel` (TUI only) | preinstalled |
 | python3 | `python3` | `python3` (for `make test` only) | preinstalled |
-| mandoc | `mandoc` | `mandoc` (CI man-page lint only) | `brew install mandoc` |
+| mandoc | `mandoc` | `mandoc` (optional, man-page lint) | `brew install mandoc` |
 
 ---
 

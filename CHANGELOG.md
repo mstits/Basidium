@@ -12,7 +12,7 @@ All notable changes to Basidium are documented here.
   the `--report` design: regression detection now ships in-binary.
 - **`--validate <file.tco>`** parses and reports a scenario without running
   it. Exits 0 on a valid file, 1 with a line-numbered diagnostic otherwise.
-  Wired into `make check` so CI catches malformed scenarios.
+  Wired into `make check` so malformed scenarios are caught before merge.
 - **`--seed N`** seeds the worker xorshift128+ stream deterministically (and
   derives `probe_signature`) so repeated runs are bit-reproducible — useful
   for diff-based regression hunts.
@@ -29,7 +29,7 @@ All notable changes to Basidium are documented here.
 - **`--stop-on-degradation N`** halts a sweep or scenario the first time
   NCCL busbw drops past the threshold (sign-tolerant — `-30`, `30` both
   mean "stop at 30% drop"); pairs with `--stop-on-failopen` for fail-fast
-  CI runs that exit 2 on regression.
+  scripted gates that exit 2 on regression.
 - **`--stop-on-failopen`** halts on first fail-open detection rather than
   running to end-of-session.
 - **`--duration` accepts `d` suffix** (e.g. `--duration 1d`) and now
@@ -37,19 +37,20 @@ All notable changes to Basidium are documented here.
 - **`--version --json`** emits machine-parsable version output.
 - **`-h` / `--help`** are now recognized; `usage()` exits 0 when explicitly
   requested, 2 on parse errors.
-- **`make asan` / `make tsan`** sanitizer build targets; both are wired
-  into separate CI matrix entries that run `--selftest` plus a full scenario
-  dry-run.
+- **`make asan` / `make tsan`** sanitizer build targets — rebuild the
+  binary with AddressSanitizer + UndefinedBehaviorSanitizer or
+  ThreadSanitizer respectively, then run `--selftest` and a scenario
+  dry-run to verify cleanliness.
 - **`make test` / `tests/run-all.sh`** — exhaustive offline test suite
-  (~125 assertions: every flag's accept/reject behavior, every error
+  (~127 assertions: every flag's accept/reject behavior, every error
   message, packet builder content via pcap-out, buffer-hygiene across
   mode boundaries via `.tco` scenarios, RNG seed determinism with byte-
   level pcap diff, profile loader (XDG fallback, CRLF, MODE_INVALID,
   range checks, traversal blocking), `--diff` regression detection,
-  NDJSON/CSV/compact reports, signal handling). Wired into CI.
-- **CI**: `--validate` runs over every `examples/*.tco`; `mandoc -Tlint`
-  exercises the man page; ASan+UBSan and TSan matrix entries catch
-  leak/UB/race regressions mechanically; full offline test suite gates merges.
+  NDJSON/CSV/compact reports, signal handling, bounded-`-n` termination,
+  bash completion syntax, sanitizer build).
+- **`make check`** — also runs `--validate` over every `examples/*.tco`
+  so malformed scenarios fail the local pre-merge check.
 - New example scenarios: `pfc-recovery.tco`, `multi-mode-soak.tco`.
 - **Bash completion** (`contrib/basidium.bash`) covers modes, flags,
   scenario file paths, and saved profile names.
