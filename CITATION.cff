@@ -1,0 +1,33 @@
+cff-version: 1.2.0
+message: "If you use Basidium in academic or industrial fabric-qualification work, please cite it as below."
+title: "Basidium: Multi-threaded Layer-2 Stress and Hardware Evaluation Tool for GPU Cluster Fabrics"
+type: software
+version: "2.5"
+date-released: 2026-04-26
+abstract: >-
+  Basidium is a libpcap-based Layer-2 packet injection utility for stress-testing
+  and qualifying lossless Ethernet fabrics that carry RoCE / RDMA traffic in GPU
+  training clusters.  It supports CAM-table flooding, gratuitous ARP / DHCP /
+  ND / IGMP / LLDP / STP storms, IEEE 802.1Qbb PFC PAUSE injection, VLAN range
+  cycling, QinQ double-tagging, NCCL throughput correlation, multi-step Targeted
+  Congestion Orchestration scenarios, and a regression-detection workflow built
+  around bit-reproducible runs (--seed), JSON / CSV reports, fail-fast mid-run
+  halts (--stop-on-degradation, --stop-on-failopen), and a step-by-step report
+  diff tool (--diff).
+authors:
+  - family-names: Stits
+    given-names: Matthew
+    email: stits@stits.org
+repository-code: "https://github.com/mstits/Basidium"
+license: MIT
+keywords:
+  - ethernet
+  - rdma
+  - rocev2
+  - pfc
+  - nccl
+  - gpu-cluster
+  - network-fabric
+  - stress-testing
+  - hardware-qualification
+  - regression-detection

@@ -1,4 +1,4 @@
-# Basidium (V2.4)
+# Basidium (V2.5)
 
 **Multi-threaded Layer-2 Stress & Hardware Evaluation Tool for GPU Cluster Fabrics**
 
@@ -25,6 +25,27 @@ A *basidium* (from the Latin, meaning "little pedestal") is the structural found
 
 In a GPU cluster, **the network fabric is the basidium**. The models get the headlines, but they cannot exist without a stable pedestal. If the fabric is cracked, jittery, or misconfigured, the entire computational process fails. Basidium ensures the pedestal doesn't buckle under the weight of line-rate traffic before you risk your training budget.
 
+### What's new in v2.5
+
+- **`--diff` companion** — compare two reports step-by-step. Pair with
+  `--seed` for bit-reproducible regression hunts.
+- **`--stop-on-degradation N` / `--stop-on-failopen`** — halt sweeps and
+  scenarios the moment a regression or fail-open is detected. Exits 2,
+  scriptable for CI gating.
+- **`--validate scenario.tco`, `--print-config`, `--list-modes`,
+  `--list-profiles`** — quality-of-life diagnostics for shell scripting and
+  debugging silently-merged profile loads.
+- **`--seed N`, `--ndjson`, `--csv`, `--report-compact`** — deterministic
+  runs and machine-readable output for downstream tooling.
+- **Hardening** — atomic `conf.mode`/`conf.pps`, packed wire-format structs
+  with `_Static_assert`, validated `strtol` everywhere (`-V 5000`,
+  `-T 10.0.0.0/40`, `-S 00:11`, `--duration 5x` now error out instead of
+  corrupting state), `sigaction` + SIGPIPE-ignore, OS-entropy RNG seeding,
+  proper `clock_gettime`-based per-packet rate limiter.
+- **CI** runs ASan + UBSan, validates every `examples/*.tco`, and
+  `mandoc -Tlint`s the man page.
+- **Bash completion** in `contrib/basidium.bash`.
+
 ### Core Capabilities
 
 ```mermaid
@@ -45,10 +66,17 @@ graph LR
         TCO["TCO Scenarios<br/>multi-mode congestion patterns<br/>.tco scenario files"]
     end
 
+    subgraph "Regression Detection"
+        STOP["--stop-on-degradation<br/>--stop-on-failopen<br/>halt + exit 2 in CI"]
+        DIFF["--diff baseline.json today.json<br/>step-by-step pps + busbw delta"]
+    end
+
     PFC & CAM & ARP & STP --> SWEEP
     SWEEP --> NCCL
     TCO --> |"mode + PPS<br/>per step"| PFC & CAM & ARP & STP
     TCO --> NCCL
+    NCCL --> STOP
+    SWEEP & TCO --> |"JSON report"| DIFF
 ```
 
 - **PFC / RDMA Stress:** Flood PFC PAUSE frames to confirm RoCE/RDMA priority flow control is correctly configured and does not deadlock under congestion — a known failure mode in lossless Ethernet fabrics.
@@ -56,7 +84,7 @@ graph LR
 - **Rate Sweeps:** Generate precise rate sweeps with JSON reporting to establish forwarding capacity baselines and detect regressions over time.
 - **NCCL Co-Validation:** Run injection patterns simultaneously with NCCL collective tests to observe how Layer-2 stress conditions measurably affect application-layer throughput. This side-by-side view helps isolate whether a performance problem originates in the fabric or the software stack.
 - **Targeted Congestion Orchestration (TCO):** Define multi-step, multi-mode congestion scenarios (`.tco` files) that switch between flood modes at runtime while measuring NCCL degradation at each step.
-- **Regression Detection:** Identify performance drift caused by firmware updates, configuration changes, physical layer degradation, or incremental topology changes.
+- **Regression Detection:** Identify performance drift caused by firmware updates, configuration changes, physical layer degradation, or incremental topology changes. `--seed` makes runs bit-reproducible; `--diff` compares two reports step-by-step and exits 2 on threshold breach; `--stop-on-degradation` and `--stop-on-failopen` halt mid-run for fail-fast CI.
 
 > **Authorization required.** Use only on airgapped hardware you own or have explicit written permission to test. Never run against production infrastructure or equipment belonging to others.
 >
@@ -71,19 +99,24 @@ graph LR
 
 ```mermaid
 graph TD
-    CLI["basidium.c<br/>CLI / main loop"] --> FLOOD["flood.c<br/>packet builders<br/>worker threads"]
+    CLI["basidium.c<br/>CLI / main loop<br/>sigaction + SIGPIPE ignored"] --> FLOOD["flood.c<br/>packet builders<br/>worker threads<br/>clock_gettime token-bucket"]
     CLI --> TUI["tui.c<br/>ncurses TUI"]
-    CLI --> SWEEP["sweep_thread<br/>rate ramp"]
+    CLI --> SWEEP["sweep_thread<br/>rate ramp<br/>--stop-on-degradation"]
     CLI --> TCO["tco.c<br/>scenario orchestrator"]
-    CLI --> SNIFF["sniffer_thread<br/>learning / adaptive<br/>fail-open detection"]
-    FLOOD --> PCAP["libpcap<br/>pcap_inject"]
-    TCO --> |"mutates conf.mode<br/>+ conf.pps"| FLOOD
-    SWEEP --> |"mutates conf.pps<br/>+ launches NCCL"| NCCL
+    CLI --> SNIFF["sniffer_thread<br/>learning / adaptive<br/>fail-open detection<br/>--stop-on-failopen"]
+    CLI --> DIFF["diff.c<br/>--diff a.json b.json<br/>regression detector"]
+    FLOOD --> PCAP["libpcap<br/>pcap_inject<br/>pcap_next_ex"]
+    TCO --> |"_Atomic conf.mode<br/>+ _Atomic conf.pps"| FLOOD
+    SWEEP --> |"_Atomic conf.pps<br/>+ launches NCCL"| NCCL
     TCO --> |"launches NCCL<br/>per step"| NCCL["nccl.c<br/>NCCL subprocess"]
     TUI --> NCCL
     TUI --> NIC["nic_stats.c<br/>Linux: /sys/class/net<br/>macOS: getifaddrs"]
-    CLI --> REPORT["report.c<br/>JSON report"]
-    CLI --> PROFILES["profiles.c<br/>~/.basidium/"]
+    CLI --> REPORT["report.c<br/>JSON / CSV / compact"]
+    CLI --> PROFILES["profiles.c<br/>XDG_CONFIG_HOME<br/>+ legacy ~/.basidium/"]
+    SWEEP -.-> |"--stop-on-degradation"| CLI
+    SNIFF -.-> |"--stop-on-failopen"| CLI
+
+    style DIFF fill:#369,stroke:#000,color:#fff
 ```
 
 ### Flood Modes & Packet Path
@@ -115,13 +148,21 @@ graph LR
 
 ```mermaid
 graph TD
-    MAIN[main thread<br/>seeds probe_signature] --> W0[Worker 0<br/>rng_init seed=0]
-    MAIN --> W1[Worker 1<br/>rng_init seed=1]
-    MAIN --> WN[Worker N<br/>rng_init seed=N]
+    SRC{"--seed N<br/>set?"} -->|"no"| ENTROPY["entropy_seed<br/>getrandom() / urandom"]
+    SRC -->|"yes"| FIXED["rng_base_seed = N<br/>(deterministic)"]
+    ENTROPY & FIXED --> MAIN[main thread<br/>derives probe_signature]
 
-    W0 --> RNG0[xorshift128+<br/>thread-local state]
-    W1 --> RNG1[xorshift128+<br/>thread-local state]
-    WN --> RNGN[xorshift128+<br/>thread-local state]
+    MAIN --> W0[Worker 0<br/>rng_init_seed offset=0]
+    MAIN --> W1[Worker 1<br/>rng_init_seed offset=1]
+    MAIN --> WN[Worker N<br/>rng_init_seed offset=N]
+
+    W0 --> MIX0["SplitMix64<br/>finalizer (decorrelate<br/>adjacent offsets)"]
+    W1 --> MIX1["SplitMix64<br/>finalizer"]
+    WN --> MIXN["SplitMix64<br/>finalizer"]
+
+    MIX0 --> RNG0[xorshift128+<br/>thread-local state]
+    MIX1 --> RNG1[xorshift128+<br/>thread-local state]
+    MIXN --> RNGN[xorshift128+<br/>thread-local state]
 
     RNG0 --> B0[build_packet_*<br/>rng_rand for MACs,IPs]
     RNG1 --> B1[build_packet_*<br/>rng_rand for MACs,IPs]
@@ -177,26 +218,41 @@ graph TB
     subgraph "Basidium Host"
         B["Basidium"]
         TCO_F[".tco scenario"]
+        SEED["--seed N<br/>(deterministic)"]
         NCCL_T["NCCL test"]
-        REPORT_F["JSON report"]
+        REPORT_F["JSON / CSV report"]
     end
 
-    TCO_F --> |"defines steps"| B
+    subgraph "CI / Regression Detection"
+        BASE["baseline.json<br/>(captured pre-change)"]
+        DIFF["basidium --diff<br/>baseline.json today.json"]
+        VERDICT{"exit code"}
+    end
+
+    TCO_F & SEED --> |"defines steps + seed"| B
     B --> |"inject PFC/MAC/ARP/STP"| TOR1
     B --> |"launches per step"| NCCL_T
     NCCL_T --> |"allreduce via fabric"| TOR1
     B --> REPORT_F
+    BASE --> DIFF
+    REPORT_F --> |"today.json"| DIFF
+    DIFF --> VERDICT
+    VERDICT --> |"0 = OK"| OK["merge PR / promote build"]
+    VERDICT --> |"2 = regression"| FAIL["fail CI / page oncall"]
 
     style B fill:#2d6,stroke:#000,color:#fff
     style TOR1 fill:#f96,stroke:#000
     style TCO_F fill:#369,stroke:#000,color:#fff
+    style DIFF fill:#369,stroke:#000,color:#fff
+    style FAIL fill:#c33,stroke:#000,color:#fff
 ```
 
 ---
 
 ## Building
 
-**Dependencies:** `libpcap-dev`, `libncurses-dev` (TUI only), `gcc`, `make`
+**Dependencies:** `libpcap-dev`, `libncurses-dev` (TUI only), `gcc`, `make`,
+`python3` + `bash` (for `make test` only), `mandoc` (for man-page lint in CI only)
 
 ```sh
 # CLI only
@@ -205,17 +261,29 @@ make
 # With ncurses TUI
 make TUI=1
 
-# Debug build
+# Debug build (no fortify, no opt)
 make debug
 
-# Install to /usr/local
+# AddressSanitizer + UndefinedBehaviorSanitizer
+make asan
+
+# ThreadSanitizer
+make tsan
+
+# Install to /usr/local (includes man page, examples, bash completion)
 sudo make install
 
 # Custom prefix
 sudo make install PREFIX=/opt/local
 
-# Self-test (14 validation tests: packet builders + TCO/NCCL parsers)
+# 14-test self-test suite (packet builders + TCO/NCCL parsers)
 sudo make selftest
+
+# Exhaustive offline test suite (~125 assertions: every flag, error path,
+# packet-builder content via pcap-out, RNG determinism, profile loader,
+# diff regression detection, NDJSON/CSV/compact reports, signal handling,
+# sanitizer build).  Does not need sudo or a NIC.
+make test
 ```
 
 **Platform notes:**
@@ -249,6 +317,17 @@ sudo ./basidium -i eth0 --detect -A --tui
 
 # ---- Dry Run (no sudo, no NIC) ----
 ./basidium --dry-run -M pfc -n 1000
+
+# ---- Regression Detection ----
+sudo ./basidium -i eth0 --sweep 1000:50000:5000:30 --nccl --report=baseline.json --seed 42
+# ... after a firmware change, repeat the run, then compare:
+sudo ./basidium -i eth0 --sweep 1000:50000:5000:30 --nccl --report=today.json --seed 42
+basidium --diff baseline.json today.json --diff-threshold-busbw -10
+
+# ---- Fail-fast in CI ----
+sudo ./basidium -i eth0 --scenario examples/pfc-recovery.tco --nccl \
+    --stop-on-degradation 30 --stop-on-failopen --report=ci.json
+# Exit 2 means regression — fail the job.
 ```
 
 *Build your models on a solid pedestal. Build on Basidium.*
@@ -338,14 +417,39 @@ Ramps injection rate from `start` to `end` PPS in `step` increments, holding eac
 ### Profiles & Sessions
 | Flag | Description |
 |------|-------------|
-| `--profile <name>` | Load `~/.basidium/<name>.conf` |
-| `--duration <time>` | Auto-stop: `30`, `5m`, `2h` |
+| `--profile <name>` | Load `~/.basidium/<name>.conf` (also honors `$XDG_CONFIG_HOME` and `$BASIDIUM_PROFILE_DIR`) |
+| `--duration <time>` | Auto-stop: `30`, `5m`, `2h`, `1d` |
+
+### Stop Conditions (Fail-Fast for CI)
+| Flag | Description |
+|------|-------------|
+| `--stop-on-failopen` | Halt run on first fail-open detection (exit 2) |
+| `--stop-on-degradation N` | Halt sweep/scenario when NCCL busbw drops past `-N%` (sign-tolerant; exit 2) |
+
+### Output (Machine-Readable)
+| Flag | Description |
+|------|-------------|
+| `--ndjson` | One JSON status object per second on stdout (replaces in-place spinner) |
+| `--csv <file>` | Emit sweep/scenario steps as CSV alongside the JSON report |
+| `--report-compact` | Single-line JSON report (post-processed; quoted strings preserved) |
+
+### Regression Detection
+| Flag | Description |
+|------|-------------|
+| `--diff <a.json> <b.json>` | Compare two reports; exit 2 on threshold breach (subcommand-style: skips other flags) |
+| `--diff-threshold-pps N` | PPS regression threshold for `--diff` (default `-10`) |
+| `--diff-threshold-busbw N` | NCCL busbw regression threshold for `--diff` (default `-10`) |
+| `--seed N` | Seed RNG and probe signature deterministically (default: OS entropy via `getrandom()` / `/dev/urandom`) |
 
 ### Diagnostics
 | Flag | Description |
 |------|-------------|
 | `--selftest` | Run 14 built-in validation tests |
-| `--version` | Print version and exit |
+| `--validate <file.tco>` | Parse and validate a scenario file (exit 0/1; line-numbered diagnostics) |
+| `--print-config` | Dump merged effective config (defaults + profile + flags) and exit |
+| `--list-modes` | Print supported flood modes and exit (one per line) |
+| `--list-profiles` | Print saved profile names and exit (one per line) |
+| `--version` | Print version and exit (`--version --json` for machine-parsable form) |
 | `--dry-run` | Build & count packets without injecting (no sudo needed) |
 
 ---
@@ -526,6 +630,7 @@ sequenceDiagram
     SW2-->>B: echo [ip_id=probe]
     B->>B: fail_open_detected = 1
     B-->>B: TUI alert + FAIL_OPEN log event
+    note over B: --stop-on-failopen:<br/>halt run, exit 2
 ```
 
 ```sh
@@ -543,11 +648,13 @@ flowchart LR
     N -->|yes| F[launch NCCL test]
     F --> G[wait for NCCL completion]
     G --> H[record PPS + busbw]
+    H --> SOD{"--stop-on-degradation<br/>threshold breached?"}
+    SOD -->|yes| HALT["halt: write report<br/>exit 2"]
+    SOD -->|no| C
     N -->|no| E[record achieved PPS]
     E --> C{reached sweep_end?}
-    H --> C
     C -->|no| A
-    C -->|yes| D["write JSON report<br/>exit"]
+    C -->|yes| D["write JSON / CSV report<br/>exit 0"]
 ```
 
 ```sh
@@ -597,16 +704,18 @@ Scenario files (`.tco`) define multi-step, multi-mode congestion patterns for au
 
 ```mermaid
 flowchart TD
-    LOAD["Load .tco scenario"] --> STEP["Apply step: set mode + PPS"]
+    LOAD["Load + validate .tco scenario<br/>(or basidium --validate file)"] --> STEP["Apply step: _Atomic conf.mode + conf.pps<br/>workers detect change, memset buffer, rebuild template"]
     STEP --> INJECT["Workers inject at target rate"]
     INJECT --> NCCL_Q{"--nccl?"}
     NCCL_Q --> |yes| NCCL_RUN["Launch NCCL test<br/>measure busbw under congestion"]
     NCCL_Q --> |no| HOLD["Hold for duration_s"]
     NCCL_RUN --> HOLD
-    HOLD --> RECORD["Record achieved PPS + busbw"]
-    RECORD --> MORE{"More steps?"}
+    HOLD --> RECORD["Record achieved PPS + busbw + NIC delta"]
+    RECORD --> SOD{"--stop-on-degradation<br/>threshold breached?"}
+    SOD --> |yes| HALT["halt: write report<br/>exit 2"]
+    SOD --> |no| MORE{"More steps?"}
     MORE --> |yes| STEP
-    MORE --> |no| REPORT["Write JSON report + exit"]
+    MORE --> |no| REPORT["Write JSON / CSV report + exit 0"]
 ```
 
 ### Scenario File Format
@@ -651,6 +760,69 @@ sudo ./basidium -i eth0 --scenario examples/pfc-stress-ramp.tco --report
     ]
   }
 }
+```
+
+---
+
+## Regression Detection — `--diff`, `--seed`, `--stop-on-*`
+
+Basidium ships a built-in regression detector that closes the loop on the
+`--report` design. The typical workflow:
+
+```mermaid
+flowchart LR
+    subgraph "Capture baseline (one-time)"
+        B1["sudo basidium -i eth0<br/>--scenario qual.tco --nccl<br/>--seed 42<br/>--report=baseline.json"]
+    end
+
+    subgraph "After firmware / config / topology change"
+        B2["sudo basidium -i eth0<br/>--scenario qual.tco --nccl<br/>--seed 42<br/>--report=today.json"]
+    end
+
+    subgraph "Compare"
+        D["basidium --diff baseline.json today.json<br/>--diff-threshold-busbw -10<br/>--diff-threshold-pps -5"]
+    end
+
+    B1 -->|"baseline.json"| D
+    B2 -->|"today.json"| D
+    D --> R{"step delta<br/>vs threshold"}
+    R -->|"all within threshold"| OK["exit 0<br/>(merge / promote)"]
+    R -->|"any breach"| FAIL["exit 2<br/>(fail CI / page)"]
+
+    style D fill:#369,stroke:#000,color:#fff
+    style FAIL fill:#c33,stroke:#000,color:#fff
+```
+
+`--seed N` makes the worker RNG and probe signature deterministic, so the
+packet content of two runs at the same seed is bit-identical — the only
+legitimate source of variance between baseline and today is the fabric
+itself.
+
+`--diff` outputs a step-by-step table:
+
+```
+step  mode        old_pps      new_pps     Δpps%    old_busbw  new_busbw   Δbusbw%
+----  ----        -------      -------      -----    ---------  ---------    -------
+1     mac            1000         1000      +0.0%       76.50      76.40      -0.1%
+2     pfc            4998         4995      -0.1%       74.20      74.10      -0.1%
+3     pfc           19995        19890      -0.5%       68.10      68.00      -0.1%
+4     pfc           49800        12300     -75.3%       52.30      18.40     -64.8%
+
+REGRESSION: at least one step exceeded threshold (pps<=-5.0%, busbw<=-10.0%)
+```
+
+For mid-run halts (instead of running the full sweep / scenario and then
+diffing), pair `--stop-on-degradation N` with `--stop-on-failopen`. The
+sweep / orchestrator threads watch each step's NCCL measurement; if the
+busbw drops past `-N%` of the baseline (sign-tolerant — `30` and `-30`
+both mean "stop at 30% drop"), the run halts and exits 2 immediately.
+`--stop-on-failopen` does the same on the first echoed probe frame.
+
+```sh
+# Fail-fast CI: halt at 30% NCCL drop OR first fail-open detection
+sudo ./basidium -i eth0 --scenario qual.tco --nccl --seed 42 \
+    --stop-on-degradation 30 --stop-on-failopen --report=ci.json
+# Exit 2 means regression — fail the job.
 ```
 
 ---
@@ -704,7 +876,13 @@ sudo ./basidium -i eth0 -V 100 --qinq 200 -t 4
 
 ## Named Profiles
 
-Profiles are stored in `~/.basidium/` as key=value files. All fields — VLAN, PFC, sweep, burst, detect, QinQ, payload, threads, rate — are persisted. Profile names are restricted to alphanumeric characters, dashes, and underscores to prevent path traversal.
+Profiles are stored as key=value files. The lookup order is:
+
+1. `$BASIDIUM_PROFILE_DIR` (explicit override)
+2. `$XDG_CONFIG_HOME/basidium/` (XDG basedir spec) — used only when the legacy directory does not exist
+3. `~/.basidium/` (legacy, kept for compat)
+
+All fields — VLAN, PFC, sweep, burst, detect, QinQ, payload, threads, rate — are persisted. Profile names are restricted to alphanumeric characters, dashes, and underscores to prevent path traversal. Numeric fields are validated against their accepted ranges on load (so e.g. `threads=99` or `mode=bogus` is rejected with a field-named diagnostic instead of silently falling back to defaults). CRLF line endings are tolerated.
 
 ```sh
 # Save from TUI: press p → s → type name → Enter
@@ -712,6 +890,12 @@ Profiles are stored in `~/.basidium/` as key=value files. All fields — VLAN, P
 # Load from CLI
 sudo ./basidium --profile rdma-stress
 sudo ./basidium --profile stp-flood
+
+# List saved profiles
+basidium --list-profiles
+
+# Inspect what a profile resolves to
+basidium --profile rdma-stress --print-config
 ```
 
 ---
@@ -719,24 +903,37 @@ sudo ./basidium --profile stp-flood
 ## Source Layout
 
 ```
-basidium.c      main(), CLI parsing, thread orchestration, SIGINT/SIGTERM
-flood.c         packet builders, worker threads, sniffer, RNG, selftest
-flood.h         shared types, flood_mode_t enum, config struct, prototypes
-tco.c/.h        TCO scenario parser + orchestrator thread
-tui.c           ncurses TUI (make TUI=1)
-nccl.c/.h       NCCL subprocess orchestration
-profiles.c/.h   named profile save/load (~/.basidium/) with name sanitization
-nic_stats.c/.h  NIC statistics (Linux: sysfs, macOS/BSD: getifaddrs)
-report.c/.h     JSON session report writer
+basidium.c          main(), CLI parsing, thread orchestration, sigaction
+                    sigaction(SIGINT/SIGTERM/SIGPIPE), validated strtol parsers
+flood.c             packet builders, worker threads, sniffer, RNG (xorshift128+
+                    seeded via getrandom()/urandom + SplitMix64), token-bucket
+                    rate limiter (clock_gettime + nanosleep), selftest
+flood.h             shared types, flood_mode_t enum, config struct, prototypes;
+                    wire-format structs are __attribute__((packed)) with
+                    _Static_assert size guards
+tco.c/.h            TCO scenario parser + orchestrator thread
+tui.c               ncurses TUI (make TUI=1)
+nccl.c/.h           NCCL subprocess orchestration
+profiles.c/.h       named profile save/load with XDG_CONFIG_HOME support, CRLF
+                    tolerance, range-checked strtol fields, name sanitization
+nic_stats.c/.h      NIC statistics (Linux: sysfs, macOS/BSD: getifaddrs)
+report.c/.h         JSON / CSV / compact session report writer
+diff.c/.h           --diff regression detection: parse two reports, compare
+                    pps_achieved + nccl_busbw step-by-step, exit 2 on breach
+contrib/
+    basidium.bash   bash completion (modes, flags, scenario files, profiles)
+examples/*.tco      shipped scenarios (validated in CI via --validate)
+tests/run-all.sh    exhaustive offline test suite (~125 assertions)
+basidium.8          man page (linted with mandoc -Tlint in CI)
 ```
 
 ### Fast Path
 
-In MAC flood mode without stealth, learning, or VLAN-range active, workers use Xorshift128+ to overwrite only the 12 MAC bytes of a pre-built frame template — no packet-builder overhead, near wire-rate throughput.
+In MAC flood mode without stealth, learning, or VLAN-range active, workers use Xorshift128+ to overwrite only the 12 MAC bytes of a pre-built frame template — no packet-builder overhead, near wire-rate throughput. The fast path uses `memcpy` for alignment safety on strict-alignment platforms; mode switches under TCO trigger a buffer wipe + template rebuild before the next iteration so stale bytes from the previous mode never leak forward.
 
 ### Thread Safety
 
-All packet builders accept a per-thread `struct rng_state *` parameter. No global `rand()` calls occur in worker threads. Each thread initializes its own xorshift128+ state from a unique seed, ensuring deterministic, lock-free random number generation.
+All packet builders accept a per-thread `struct rng_state *` parameter. No global `rand()` calls occur in worker threads. Each thread initializes its own xorshift128+ state from a base seed (entropy or `--seed N`) mixed through SplitMix64 with a per-thread offset, so adjacent threads do not produce correlated streams. `conf.mode` and `conf.pps` are `_Atomic`-qualified, giving sweep/TCO-to-worker writes seq_cst semantics without changing call-site syntax. ASan + UBSan + TSan all run clean in CI.
 
 ---
 
@@ -747,6 +944,8 @@ All packet builders accept a per-thread `struct rng_state *` parameter. No globa
 | libpcap | `libpcap-dev` | `libpcap-devel` | `brew install libpcap` (usually preinstalled) |
 | libpthread | standard | standard | standard |
 | libncurses | `libncurses-dev` | `ncurses-devel` (TUI only) | preinstalled |
+| python3 | `python3` | `python3` (for `make test` only) | preinstalled |
+| mandoc | `mandoc` | `mandoc` (CI man-page lint only) | `brew install mandoc` |
 
 ---
 

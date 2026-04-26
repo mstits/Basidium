@@ -22,3 +22,10 @@ basidium-*.json
 # Debug builds
 core
 core.*
+
+# macOS debug symbol bundles (asan / debug builds)
+*.dSYM/
+
+# Generated test artifacts (tests/run-all.sh keeps state in mktemp dirs,
+# but stray top-level reports from manual runs match basidium-*.json
+# already covered above)

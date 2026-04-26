@@ -1,4 +1,4 @@
-.TH BASIDIUM 8 "April 2026" "Basidium v2.3" "System Administration"
+.TH BASIDIUM 8 "2026-04-26" "Basidium v2.5" "System Administration"
 .SH NAME
 basidium \- multi-threaded Layer-2 stress and hardware evaluation tool
 .SH SYNOPSIS
@@ -229,8 +229,49 @@ Print version and exit.
 Build and count packets without injecting. Does not require root
 or an active network interface. Useful for validating configuration
 and estimating packet builder throughput.
+.TP
+.B \-\-validate \fIfile.tco\fR
+Parse a scenario file and exit 0 if valid, 1 with a line-numbered
+diagnostic otherwise. Suitable for CI lints.
+.TP
+.B \-\-print\-config
+Print the merged effective config (defaults + profile + flags) as
+\fIkey=value\fR and exit. Use to debug profile loading.
+.TP
+.B \-\-list\-modes
+Print the supported flood modes one per line and exit.
+.TP
+.B \-\-list\-profiles
+Print saved profile names one per line and exit.
+.TP
+.B \-\-seed \fIN\fR
+Seed the worker RNG and probe signature deterministically (default:
+OS entropy via \fIgetrandom\fR(2) or \fI/dev/urandom\fR).
+.TP
+.B \-\-ndjson
+Replace the in-place spinner with one JSON status object per second on
+stdout. Suitable for piping to \fIjq\fR(1) or a log shipper.
+.TP
+.B \-\-csv \fIfile\fR
+Emit sweep / scenario step results as CSV alongside the JSON report.
+.TP
+.B \-\-report\-compact
+Write the JSON report on a single line.
+.TP
+.B \-\-stop\-on\-failopen
+Halt the run on first fail-open detection rather than running to end of
+session. Exit code 2.
+.TP
+.B \-\-stop\-on\-degradation \fIN\fR
+Halt the sweep or scenario when NCCL bus bandwidth drops past the given
+percentage threshold (sign-tolerant: \fI30\fR and \fI-30\fR both mean
+"stop at 30% drop"). Exit code 2.
+.TP
+.B \-\-diff \fIa.json\fR \fIb.json\fR [\-\-diff\-threshold\-pps \fIN\fR] [\-\-diff\-threshold\-busbw \fIN\fR]
+Compare two reports step-by-step and exit 2 if any axis exceeds the
+threshold (default \-10% on both). Subcommand-style: skips all other
+flags and runs as a standalone diff utility.
 .SH EXAMPLES
-.PP
 Unlimited MAC flood, 4 threads:
 .RS
 .B sudo basidium -i eth0 -t 4
@@ -285,10 +326,31 @@ TCO scenario with NCCL correlation:
 .RS
 .B sudo basidium -i eth0 --scenario fabric-test.tco --nccl --report
 .RE
+.PP
+NCCL-correlated sweep that fails fast on a 30% drop:
+.RS
+.B sudo basidium -i eth0 --sweep 1000:50000:5000:30 --nccl --stop-on-degradation 30 --report
+.RE
+.PP
+Validate every example scenario in a CI gate:
+.RS
+.B for f in examples/*.tco; do basidium --validate "$f" || exit 1; done
+.RE
+.PP
+Compare today's report to yesterday's:
+.RS
+.B basidium --diff yesterday.json today.json
+.RE
 .SH FILES
 .TP
 .I ~/.basidium/*.conf
-Named configuration profiles.
+Named configuration profiles. Honors
+.I $XDG_CONFIG_HOME
+and
+.I $BASIDIUM_PROFILE_DIR
+when the legacy
+.I ~/.basidium/
+directory does not exist.
 .TP
 .I *.tco
 TCO scenario files. Plain-text, one step per line:
@@ -302,7 +364,12 @@ Auto-generated session report.
 .SH DIAGNOSTICS
 Exit status 0 on success, 1 on fatal error, 2 if fail-open was detected
 (when using
-.BR \-\-detect ).
+.BR \-\-detect ),
+or if
+.BR \-\-stop\-on\-degradation
+or
+.BR \-\-diff
+detected a regression past the configured threshold.
 .PP
 The
 .B \-\-selftest

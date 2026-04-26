@@ -1,0 +1,17 @@
+# multi-mode-soak.tco — long-duration mixed-protocol soak.
+#
+# Six-hour run cycling through L2 stress modes at moderate rates.  Use
+# alongside SNMP polling (see README) to catch counters that only rise
+# on long timescales: ARP-table aging anomalies, IGMP snooping table
+# leaks, MAC table thrash under STP TCN.  Pair with --report and a daily
+# diff against the previous run to detect drift.
+
+mac    5000   1800           # 30 min: CAM exercise
+arp    2000   1800           # 30 min: ARP table churn
+mac    5000   1800           # 30 min: CAM (recovery)
+igmp   1500   1800           # 30 min: snooping table
+stp     500   1800           # 30 min: STP TCN flush
+mac    5000   1800           # 30 min: CAM (recovery)
+lldp   1000   1800           # 30 min: control-plane CPU
+nd     1500   1800           # 30 min: IPv6 ND table
+mac    5000   1800           # 30 min: CAM (final recovery)

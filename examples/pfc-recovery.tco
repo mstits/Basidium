@@ -1,0 +1,13 @@
+# pfc-recovery.tco — does the fabric come back?
+#
+# Drives PFC PAUSE through three escalating intensities, then drops to a
+# light MAC baseline so an --nccl run can show the recovery shape after
+# the lossless queues unblock.  Catches "stays degraded after the storm"
+# regressions where PFC watchdog fired but DCBX failed to renegotiate.
+
+mac    1000   30  nccl    # baseline measurement
+pfc    5000   45  nccl    # light pressure
+pfc   25000   45  nccl    # moderate
+pfc   80000   45  nccl    # heavy — should trigger watchdog on most ASICs
+mac    1000   60  nccl    # recovery — did the fabric come back?
+mac    1000   60  nccl    # second recovery sample
