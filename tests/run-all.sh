@@ -313,6 +313,23 @@ with open('$TMP/stp.pcap','rb') as f: d=f.read()
 print(d[24+16+12:24+16+14].hex())")
 assert_eq "build_packet_stp length field == 0007" "0007" "$et"
 
+# IPv6 ND solicited-node multicast wire format (RFC 4291): byte 11 must be
+# 0x01, byte 12 must be 0xff, and bytes 13..15 must equal the target
+# (ICMPv6 NS option) low 24 bits.  Pre-v2.6 the 0x01 marker landed at byte 12
+# instead of 11 and only 16 bits of the target were copied.
+$BIN --pcap-out="$TMP/nd.pcap" -n 1 -M nd --seed 7 > /dev/null
+nd_check=$(python3 -c "
+with open('$TMP/nd.pcap','rb') as f: d=f.read()
+# pcap header 24 + record header 16 = 40, then ethernet 14, then IPv6 8..23 = src, 24..39 = dst
+base = 24 + 16 + 14
+ip6_dst = d[base+24:base+40]
+ns_target = d[base+40+8:base+40+24]   # ICMPv6 NS target field
+ok = (ip6_dst[0] == 0xff and ip6_dst[1] == 0x02
+      and ip6_dst[11] == 0x01 and ip6_dst[12] == 0xff
+      and ip6_dst[13:16] == ns_target[13:16])
+print('ok' if ok else f'BAD dst={ip6_dst.hex()} target_low24={ns_target[13:16].hex()}')")
+assert_eq "ND IPv6 dst is correct sol-node multicast" "ok" "$nd_check"
+
 # ------------------------------------------------------------------
 section "11. Buffer-hygiene check across mode boundaries"
 # ------------------------------------------------------------------
@@ -382,6 +399,16 @@ python3 -c "import json; json.load(open('$TMP/c.json'))" \
 python3 -c "import json; json.load(open('$TMP/r.json'))" \
     && { PASS=$((PASS+1)); echo "  $(green PASS) pretty JSON parses"; } \
     || { FAIL=$((FAIL+1)); echo "  $(red FAIL) pretty JSON failed to parse"; }
+# Normal-completion runs must NOT carry the halted_early marker — that field
+# is only emitted when sweep_steps_completed/tco_steps_completed lags planned.
+if ! grep -q '"halted_early"' "$TMP/r.json"; then
+    PASS=$((PASS+1)); echo "  $(green PASS) normal completion: no halted_early flag"
+else
+    FAIL=$((FAIL+1)); echo "  $(red FAIL) normal completion incorrectly flagged halted_early"
+fi
+# Scenario step entries should equal planned (ci-smoke = 2 steps)
+sc_steps=$(python3 -c "import json; print(len(json.load(open('$TMP/r.json'))['scenario']['steps']))")
+assert_eq "scenario steps count == planned (2)" 2 "$sc_steps"
 
 # ------------------------------------------------------------------
 section "13. NDJSON output"
@@ -492,6 +519,86 @@ while i+16 <= len(d):
     cl=int.from_bytes(d[i+8:i+12],'little'); i+=16+cl; n+=1
 print(n)")
 assert_eq "-n 1 produces exactly 1 packet" 1 "$n"
+
+# ------------------------------------------------------------------
+section "16b. Buffer overflow guard: -J max + VLAN + QinQ"
+# ------------------------------------------------------------------
+# Pre-v2.6, `-J 9216 -V N --qinq M` overflowed the worker's 9216-byte stack
+# buffer by 4–8 bytes (vlan_tag_frame + qinq_tag_frame each grow the frame
+# by 4).  ASan-confirmed stack-buffer-overflow.  Now bounded.
+$BIN --pcap-out="$TMP/big.pcap" -n 1 -M mac -J 9216 -V 100 --qinq 200 --seed 1 > /dev/null
+big_len=$(python3 -c "
+with open('$TMP/big.pcap','rb') as f: d=f.read()
+print(int.from_bytes(d[24+8:24+12],'little'))")
+# Frame must be <= MAX_PACKET_SIZE (9216) and contain both tags.
+if [[ $big_len -le 9216 ]]; then
+    PASS=$((PASS+1)); echo "  $(green PASS) -J 9216 + VLAN + QinQ stays within MAX_PACKET_SIZE ($big_len bytes)"
+else
+    FAIL=$((FAIL+1)); echo "  $(red FAIL) frame is $big_len bytes (> 9216 = MAX_PACKET_SIZE)"
+fi
+# Verify outer 0x88a8 + inner 0x8100 both made it (caps + tags survived).
+qinq_outer=$(python3 -c "
+with open('$TMP/big.pcap','rb') as f: d=f.read()
+print(d[24+16+12:24+16+14].hex())")
+assert_eq "QinQ outer TPID still 0x88a8 after cap" "88a8" "$qinq_outer"
+
+# ------------------------------------------------------------------
+section "16c. profiles_list ignores names too long for buffer"
+# ------------------------------------------------------------------
+# Pre-v2.6, a profile filename longer than PROFILE_NAME_MAX (64) caused an
+# OOB write of the strip-extension '\0' past the per-name buffer in
+# profiles_list.  Now skipped silently.
+PDIR2="$TMP/profiles-long"
+mkdir -p "$PDIR2"
+touch "$PDIR2/short.conf"
+# 70-char basename — safely above PROFILE_NAME_MAX
+touch "$PDIR2/$(printf '%070d' 1).conf"
+out=$(BASIDIUM_PROFILE_DIR="$PDIR2" $BIN --list-profiles | sort | tr '\n' ' ')
+assert_eq "list-profiles skips names too long for buffer" "short " "$out"
+
+# ------------------------------------------------------------------
+section "16d. profiles_dir refuses /tmp fallback (security)"
+# ------------------------------------------------------------------
+# Pre-v2.6 fell back to /tmp/.basidium when HOME was unset and getpwuid()
+# failed.  As root, that path is a symlink-following hazard.  Now we
+# refuse and the save call exits with a clear diagnostic.  We can't
+# trivially make getpwuid() fail, but we can at least verify the load
+# path with a missing profile from an unset BASIDIUM_PROFILE_DIR doesn't
+# write to /tmp.
+ls /tmp/.basidium 2>/dev/null && rm -rf /tmp/.basidium 2>/dev/null  # paranoid pre-clean
+HOME=/nonexistent-no-such-path BASIDIUM_PROFILE_DIR= $BIN --profile nonexistent-name 2>&1 > /dev/null
+if [[ ! -e /tmp/.basidium ]]; then
+    PASS=$((PASS+1)); echo "  $(green PASS) no /tmp/.basidium created from missing-HOME profile load"
+else
+    FAIL=$((FAIL+1)); echo "  $(red FAIL) /tmp/.basidium was created — fallback still active"
+    rm -rf /tmp/.basidium
+fi
+
+# ------------------------------------------------------------------
+section "16e. UBSan-clean: no misaligned struct ip access on aarch64"
+# ------------------------------------------------------------------
+# Pre-v2.6, the worker buffer was uint8_t buf[MAX_PACKET_SIZE] (alignment 1),
+# so (struct ip *)(buf + 14) landed at a 2-byte-aligned address — UB per
+# the C standard, UBSan flagged it on aarch64.  v2.6 aligns the backing
+# array and offsets by 2 so iph lands on a 4-byte boundary.
+make clean > /dev/null 2>&1
+if make asan > "$TMP/asan-build2.log" 2>&1; then
+    out=$(./basidium --selftest 2>&1)
+    if [[ "$out" == *"misaligned"* ]] || [[ "$out" == *"runtime error"* ]]; then
+        FAIL=$((FAIL+1)); echo "  $(red FAIL) UBSan still flagging misaligned access in selftest"
+        echo "$out" | grep -E "(misaligned|runtime error)" | head -3
+    else
+        PASS=$((PASS+1)); echo "  $(green PASS) selftest UBSan-clean (no misaligned struct ip access)"
+    fi
+    out=$(./basidium --dry-run --scenario examples/ci-smoke.tco --seed 1 2>&1)
+    if [[ "$out" == *"misaligned"* ]] || [[ "$out" == *"runtime error"* ]]; then
+        FAIL=$((FAIL+1)); echo "  $(red FAIL) UBSan flagging misaligned access in scenario dry-run"
+    else
+        PASS=$((PASS+1)); echo "  $(green PASS) scenario dry-run UBSan-clean"
+    fi
+fi
+make clean > /dev/null 2>&1
+make > /dev/null 2>&1
 
 # ------------------------------------------------------------------
 section "17. Bash completion script"

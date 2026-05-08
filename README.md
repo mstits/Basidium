@@ -24,6 +24,29 @@ A *basidium* (from the Latin, meaning "little pedestal") is the structural found
 
 In a GPU cluster, **the network fabric is the basidium**. The models get the headlines, but they cannot exist without a stable pedestal. If the fabric is cracked, jittery, or misconfigured, the entire computational process fails. Basidium ensures the pedestal doesn't buckle under the weight of line-rate traffic before you risk your training budget.
 
+### Scope — What Basidium Is and Isn't
+
+**It is** an open, scriptable Layer-2 stress + NCCL correlation + reproducible-diff harness for lab and staging qualification of GPU cluster fabrics. It fits between "write some scapy scripts" and "buy an Ixia."
+
+**Where it sits relative to existing tools:**
+
+| Tool | Role | Overlap with Basidium |
+|---|---|---|
+| `nccl-tests` | Collective bandwidth measurement | Basidium runs it per-step under congestion |
+| MLNX_OFED (`ibdiagnet`, `perftest`) | Link health, RDMA point-to-point | Diagnostic vs. stress — different layer |
+| Cumulus NetQ | Switch-side telemetry | Observation vs. injection — different angle |
+| TRex / pktgen-DPDK | Generic L2/L3 packet generators | Higher per-host pps; no PFC defaults, no NCCL tie-in, no scenario format |
+| Spirent / Keysight Ixia / Xena | Hardware-accurate fabric testers | Higher fidelity, certified reports, six-figure cost |
+
+**What it isn't:**
+
+- **Not a single-host line-rate generator for 400/800 GbE spines.** libpcap caps around 3–5 Mpps/core. Saturating a real GPU spine takes multiple coordinated injectors or an AF_XDP / DPDK backend. Multi-host coordination and a faster TX backend are tracked for v2.6+.
+- **Not a substitute for a real training workload.** `nccl-tests` allreduce is a proxy. Overlapped gradient sync in real Megatron / NeMo steps has different congestion dynamics that allreduce alone does not capture.
+- **Not a realistic PFC backpressure simulator.** PFC PAUSE flooding is brute-force frame injection — it verifies *"does the switch's PFC watchdog fire correctly under malformed input"*, not realistic buffer-pressure feedback loops driven by actual queue occupancy.
+- **Not for production fabrics.** See the Total Cluster Outage warning below.
+
+**Where it earns its keep:** airgapped lab qualification, firmware / topology regression gates (`--seed` + `--diff` + exit 2), PFC watchdog verification, fail-open detection during bring-up, and CI-style fabric checks for teams that don't have or don't want commercial test gear.
+
 ### What's new in v2.5
 
 - **`--diff` companion** — compare two reports step-by-step. Pair with
@@ -636,6 +659,14 @@ sequenceDiagram
 ```sh
 sudo ./basidium -i eth0 --detect -A --tui
 ```
+
+> **Platform note:** `--detect` relies on the kernel not echoing your own
+> injected TX into the local capture stream. Linux raw sockets behave this
+> way by default, so the probe-signature path is reliable there. macOS BPF
+> captures TX frames locally, which would trigger the alert on every run —
+> on macOS, treat `--detect` as a no-op until v2.7's receiver-mode design
+> closes the gap. Use `-A` (broadcast-rate adaptive throttling) as a coarse
+> proxy on macOS in the meantime.
 
 ---
 
