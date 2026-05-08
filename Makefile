@@ -9,7 +9,7 @@ CFLAGS  = -Wall -Wextra -Wformat=2 -Wshadow -Wnull-dereference \
           -fno-strict-aliasing -O2 -D_FORTIFY_SOURCE=2
 LDFLAGS = -lpcap -pthread
 
-VERSION = 2.5
+VERSION = 2.6
 CFLAGS += -DBASIDIUM_VERSION=\"$(VERSION)\"
 
 TARGET  = basidium

@@ -85,7 +85,7 @@ section "2. Help / version / list flags"
 # ------------------------------------------------------------------
 assert_exit "--version exit 0"        0 $BIN --version
 out=$($BIN --version --json)
-assert_eq "--version --json content"  '{"version": "2.5"}' "$out"
+assert_eq "--version --json content"  '{"version": "2.6"}' "$out"
 assert_exit "--help exit 0"           0 $BIN --help
 assert_exit "-h exit 0"               0 $BIN -h
 out=$($BIN --list-modes | tr '\n' ' ')

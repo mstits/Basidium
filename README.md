@@ -1,4 +1,4 @@
-# Basidium (V2.5)
+# Basidium (V2.6)
 
 **Multi-threaded Layer-2 Stress & Hardware Evaluation Tool for GPU Cluster Fabrics**
 

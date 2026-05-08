@@ -39,7 +39,7 @@
 #include "diff.h"
 
 #ifndef BASIDIUM_VERSION
-#define BASIDIUM_VERSION "2.5"
+#define BASIDIUM_VERSION "2.6"
 #endif
 
 /*

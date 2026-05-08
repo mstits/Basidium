@@ -2,6 +2,97 @@
 
 All notable changes to Basidium are documented here.
 
+## [2.6] — 2026-05-08
+
+Bug-hunt patch release. No new user-facing features; eleven correctness
+and safety fixes across the builders, runtime, profile loader, NCCL
+subprocess, and TUI. Three sanitizer suites (ASan, UBSan, TSan) clean
+on selftest + scenario dry-run. 136 regression assertions in
+`tests/run-all.sh` (up from 127).
+
+### Fixed
+- **TCO orchestrator now honors `--stop-on-degradation`** — pre-2.6
+  measured NCCL busbw and recorded the baseline but never compared
+  against the threshold, so scenario-based fail-fast CI gates were
+  silent. Mirrors the existing sweep-thread gate.
+- **Sweep + scenario reports stop emitting zeroed phantom rows for
+  steps that never ran.** New `sweep_steps_completed` /
+  `tco_steps_completed` atomic counters drive the JSON+CSV iteration; a
+  truncated run now emits `"halted_early": true, "steps_planned": N` so
+  downstream tools can distinguish "halted at step K" from "ran all N".
+- **IPv6 ND solicited-node multicast destination was malformed off-by-
+  one** — the `0x01` marker landed at byte 12 instead of 11 and only 16
+  bits of the target address were copied. Now matches RFC 4291 §2.7.1.
+  Selftest extended to assert the full layout against the ICMPv6 NS
+  target field.
+- **`--sweep` parse rejects step counts that overflow
+  `MAX_SWEEP_STEPS`** using long-long arithmetic so the int multiply
+  cannot wrap and silently pass a too-large sweep that `flood.c` would
+  then truncate.
+- **BPF filter that was silently defeating `--detect`** — the filter
+  excluded the very probe-signature frames the C-level fail-open check
+  was looking for, making the feature non-functional on every platform.
+  Filter removed; the C-level check is reachable. README documents the
+  Linux-reliable / macOS-noisy split (macOS BPF echoes TX locally; a
+  receiver-mode design in v2.7 will close the gap).
+- **`nccl.status` is `_Atomic`** with a documented release/acquire
+  invariant. Pre-2.6, consumers in flood/tco/tui/report read
+  `status==DONE` and then the result array without holding
+  `nccl_mutex`. On weak-memory archs (Apple Silicon, Graviton, Ampere)
+  the consumer could observe `DONE` before the array writes were
+  visible.
+- **Stack buffer overflow in `build_packet_mac` with `-J 9216 -V N
+  --qinq M`** (ASan-confirmed). `vlan_tag_frame` and `qinq_tag_frame`
+  each grew the frame by 4 bytes past the worker's `MAX_PACKET_SIZE`
+  stack buffer. Both taggers now refuse to grow past the buffer;
+  `build_packet_mac` reserves room for tags so requested frame size is
+  honored minus the tag overhead.
+- **`profiles_list` OOB write** of `'\0'` past `names[count]` for
+  filenames whose basename exceeded `PROFILE_NAME_MAX`. Now skipped
+  with a length precheck.
+- **Rate limiter floor**: `-r N -t T` with `N < T` floored
+  `per_thread_pps` to 1 and emitted `T pps` instead of `N`. Period now
+  computed directly as `1e9 ns × threads / total_pps`, split across
+  `tv_sec`/`tv_nsec` to be safe on 32-bit platforms.
+- **`pcap_replay_func` swallowed `pcap_inject` failures** and inflated
+  `total_sent`. Now checks the return value and emits a one-shot
+  warning on first injection failure.
+- **Misaligned `struct ip` access**: the worker buffer and selftest
+  buffer were `uint8_t buf[N]` (alignment 1), so
+  `(struct ip *)(buf + 14)` landed at a 2-byte-aligned address — UB
+  per the C standard, UBSan-flagged on aarch64. Both buffers now use a
+  4-byte-aligned backing array offset by 2 so the IP header lands on a
+  4-byte boundary. Sniffer reads `ip_id` via `memcpy` since the
+  libpcap-managed buffer's alignment is not under our control.
+- **`profiles_dir` refuses to fall back to `/tmp`** when `HOME` is
+  unset and `getpwuid()` fails. Pre-2.6 was a symlink-following hazard
+  when the binary ran as root. The TUI's disclaimer/intro markers
+  (`.disclaimer_accepted`, `.tui_intro_seen`) honor the same guard.
+- **NCCL subprocess runs through `pipe`+`fork`+`execvp`+`waitpid`**
+  instead of `popen()`+`/bin/sh -c`. Pre-2.6 the user-supplied
+  `--nccl-binary` path and args were shell-evaluated, so any `;`,
+  `|`, `$`, backtick, etc. in those strings would be interpreted by
+  the shell. The shell is now eliminated entirely. Args tokenized via
+  `strtok_r`; child uses only async-signal-safe calls between fork and
+  exec.
+- **TUI `+`/`-` rate adjust bounded** against `INT_MAX` overflow.
+- **Worker initial `cur_mode = MODE_INVALID`** so the first loop
+  iteration always rebuilds against the live mode. Eliminates wasted
+  RNG draws in `--scenario` runs where TCO has already moved
+  `conf.mode` before the worker reaches its first iteration.
+
+### Tests
+- Nine new regression assertions in `tests/run-all.sh`:
+  - ND IPv6 dst is correct sol-node multicast (wire-format, via pcap)
+  - Normal completion does not carry `halted_early`
+  - Scenario step entries equal planned for a clean run
+  - `-J 9216 + VLAN + QinQ` stays within `MAX_PACKET_SIZE` (ASan tripwire)
+  - QinQ outer TPID survives the `-J` cap
+  - `list-profiles` skips filenames too long for the buffer
+  - `profiles_dir` does not write `/tmp/.basidium` with `HOME` unset
+  - Selftest is UBSan-clean (no misaligned `struct ip` access)
+  - Scenario dry-run is UBSan-clean
+
 ## [2.5] — 2026-04-26
 
 ### Added
