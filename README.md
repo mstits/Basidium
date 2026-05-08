@@ -47,6 +47,47 @@ In a GPU cluster, **the network fabric is the basidium**. The models get the hea
 
 **Where it earns its keep:** airgapped lab qualification, firmware / topology regression gates (`--seed` + `--diff` + exit 2), PFC watchdog verification, fail-open detection during bring-up, and CI-style fabric checks for teams that don't have or don't want commercial test gear.
 
+### What's new in v2.6
+
+Bug-hunt patch release — eleven correctness/safety fixes, no new
+user-facing features. Three sanitizers (ASan, UBSan, TSan) clean on
+selftest and scenario dry-run; 136 regression assertions.
+
+- **TCO orchestrator now honors `--stop-on-degradation`.** Pre-2.6
+  measured NCCL busbw and recorded the baseline but never compared
+  against the threshold, so `--scenario` + `--stop-on-degradation 30`
+  silently ran to completion instead of failing fast.
+- **Sweep + scenario reports stop emitting zeroed phantom rows for
+  steps that never ran.** Halted runs now carry
+  `"halted_early": true, "steps_planned": N` so downstream tools can
+  distinguish "halted at step K" from "ran all N".
+- **`--detect` is reliable on Linux again.** A BPF filter was silently
+  dropping the very probe-signature frames the C-level fail-open check
+  was looking for, making the feature non-functional. Filter removed;
+  README documents the macOS-noisy caveat (TX is captured locally on
+  BPF — receiver-mode design in v2.7 closes the gap).
+- **Stack buffer overflow fixed** (`-J 9216 -V N --qinq M`,
+  ASan-confirmed). Wire-format off-by-one in IPv6 ND solicited-node
+  multicast destination corrected to RFC 4291 §2.7.1.
+- **Rate limiter accuracy at low PPS.** `-r N -t T` with `N < T`
+  emitted `T pps` instead of `N`; period now computed directly as
+  `1e9 ns × threads / total_pps`.
+- **Subprocess-launch hardening.** `nccl-tests` runs through
+  `pipe`+`fork`+`execvp`+`waitpid` instead of `popen()`+`/bin/sh -c`,
+  eliminating shell evaluation of the user-supplied `--nccl-binary`.
+- **Memory-model fix.** `nccl.status` is `_Atomic` with a documented
+  release/acquire invariant; consumers reading `status==DONE` without
+  `nccl_mutex` are now safe on weak-memory archs.
+- **Misaligned `struct ip` access fixed** on aarch64 (UBSan-clean).
+  Worker and selftest buffers use a 4-byte-aligned backing array
+  offset by 2 so the IP header lands on a 4-byte boundary.
+- **`profiles_dir` refuses `/tmp` fallback** when `HOME` is unset and
+  `getpwuid()` fails (was a symlink-following hazard as root).
+  `profiles_list` no longer OOB-writes for filenames longer than the
+  per-name buffer.
+
+See [`CHANGELOG.md`](CHANGELOG.md) for the full list with code locations.
+
 ### What's new in v2.5
 
 - **`--diff` companion** — compare two reports step-by-step. Pair with
@@ -64,7 +105,7 @@ In a GPU cluster, **the network fabric is the basidium**. The models get the hea
   `-T 10.0.0.0/40`, `-S 00:11`, `--duration 5x` now error out instead of
   corrupting state), `sigaction` + SIGPIPE-ignore, OS-entropy RNG seeding,
   proper `clock_gettime`-based per-packet rate limiter.
-- **`make test`** — exhaustive offline test runner (~127 assertions);
+- **`make test`** — exhaustive offline test runner (136 assertions in v2.6);
   `make asan` / `make tsan` for sanitizer rebuilds; `make check` validates
   every shipped scenario; the man page lints clean with `mandoc -Tlint`.
 - **Bash completion** in `contrib/basidium.bash`.
@@ -98,7 +139,8 @@ graph LR
     SWEEP --> NCCL
     TCO --> |"mode + PPS<br/>per step"| PFC & CAM & ARP & STP
     TCO --> NCCL
-    NCCL --> STOP
+    SWEEP --> STOP
+    TCO --> STOP
     SWEEP & TCO --> |"JSON report"| DIFF
 ```
 
@@ -131,12 +173,13 @@ graph TD
     FLOOD --> PCAP["libpcap<br/>pcap_inject<br/>pcap_next_ex"]
     TCO --> |"_Atomic conf.mode<br/>+ _Atomic conf.pps"| FLOOD
     SWEEP --> |"_Atomic conf.pps<br/>+ launches NCCL"| NCCL
-    TCO --> |"launches NCCL<br/>per step"| NCCL["nccl.c<br/>NCCL subprocess"]
+    TCO --> |"launches NCCL<br/>per step"| NCCL["nccl.c<br/>fork + execvp<br/>(no shell)"]
     TUI --> NCCL
     TUI --> NIC["nic_stats.c<br/>Linux: /sys/class/net<br/>macOS: getifaddrs"]
-    CLI --> REPORT["report.c<br/>JSON / CSV / compact"]
+    CLI --> REPORT["report.c<br/>JSON / CSV / compact<br/>halted_early marker"]
     CLI --> PROFILES["profiles.c<br/>XDG_CONFIG_HOME<br/>+ legacy ~/.basidium/"]
     SWEEP -.-> |"--stop-on-degradation"| CLI
+    TCO -.-> |"--stop-on-degradation"| CLI
     SNIFF -.-> |"--stop-on-failopen"| CLI
 
     style DIFF fill:#369,stroke:#000,color:#fff
@@ -205,12 +248,12 @@ sequenceDiagram
     User->>TUI: launch --tui
     TUI->>Workers: spawn (standby)
     TUI->>Sniffer: spawn (if learning/detect)
-    Sniffer->>Sniffer: install BPF filter
     User->>TUI: press s (start)
     TUI->>Workers: set is_started=1
     loop inject
-        Workers->>Switch: inject frames
+        Workers->>Switch: inject frames (probe_signature in ip_id)
         Switch-->>Sniffer: echo (if fail-open)
+        Sniffer->>Sniffer: memcpy ip_id, compare to probe
         Sniffer-->>TUI: fail_open_detected alert
     end
     User->>TUI: press q
@@ -302,10 +345,11 @@ sudo make install PREFIX=/opt/local
 # 14-test self-test suite (packet builders + TCO/NCCL parsers)
 sudo make selftest
 
-# Exhaustive offline test suite (~125 assertions: every flag, error path,
+# Exhaustive offline test suite (136 assertions: every flag, error path,
 # packet-builder content via pcap-out, RNG determinism, profile loader,
 # diff regression detection, NDJSON/CSV/compact reports, signal handling,
-# sanitizer build).  Does not need sudo or a NIC.
+# UBSan-clean alignment, sanitizer build, ND wire format).  Does not
+# need sudo or a NIC.
 make test
 ```
 
@@ -942,19 +986,24 @@ flood.c             packet builders, worker threads, sniffer, RNG (xorshift128+
 flood.h             shared types, flood_mode_t enum, config struct, prototypes;
                     wire-format structs are __attribute__((packed)) with
                     _Static_assert size guards
-tco.c/.h            TCO scenario parser + orchestrator thread
+tco.c/.h            TCO scenario parser + orchestrator thread; honors
+                    --stop-on-degradation (fail-fast on NCCL regression)
 tui.c               ncurses TUI (make TUI=1)
-nccl.c/.h           NCCL subprocess orchestration
+nccl.c/.h           NCCL subprocess orchestration via pipe + fork + execvp
+                    (no shell evaluation); _Atomic status field publishes
+                    result-array writes to lockless consumers
 profiles.c/.h       named profile save/load with XDG_CONFIG_HOME support, CRLF
-                    tolerance, range-checked strtol fields, name sanitization
+                    tolerance, range-checked strtol fields, name sanitization;
+                    refuses /tmp fallback when HOME is unset
 nic_stats.c/.h      NIC statistics (Linux: sysfs, macOS/BSD: getifaddrs)
-report.c/.h         JSON / CSV / compact session report writer
+report.c/.h         JSON / CSV / compact session report writer; emits
+                    halted_early + steps_planned on truncated runs
 diff.c/.h           --diff regression detection: parse two reports, compare
                     pps_achieved + nccl_busbw step-by-step, exit 2 on breach
 contrib/
     basidium.bash   bash completion (modes, flags, scenario files, profiles)
 examples/*.tco      shipped scenarios (validated by `make check` via --validate)
-tests/run-all.sh    exhaustive offline test suite (~125 assertions)
+tests/run-all.sh    exhaustive offline test suite (136 assertions)
 basidium.8          man page (lints clean with `mandoc -Tlint`)
 ```
 
