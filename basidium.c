@@ -77,6 +77,7 @@ atomic_int        is_started           = 0;
 atomic_ullong     peak_pps             = 0;
 atomic_int        sweep_step_num       = 0;
 atomic_int        sweep_total_steps    = 0;
+atomic_int        sweep_steps_completed = 0;
 atomic_int        sweep_hold_rem       = 0;
 unsigned long long sweep_step_pps[MAX_SWEEP_STEPS];
 double             sweep_step_nccl_busbw[MAX_SWEEP_STEPS];
@@ -446,10 +447,14 @@ int main(int argc, char **argv) {
                     errx(1, "--sweep format: start:end:step[:hold_s]  e.g. 1000:50000:5000:10  (got '%s')", optarg);
                 if (a <= 0 || b <= a || c <= 0)
                     errx(1, "--sweep: need start < end with positive step (got %d:%d:%d)", a, b, c);
-                /* Guard against overflow when computing step count downstream. */
-                if (b - a > c * MAX_SWEEP_STEPS)
-                    errx(1, "--sweep: %d steps would exceed MAX_SWEEP_STEPS=%d — increase step",
-                         (b - a) / c, MAX_SWEEP_STEPS);
+                /* Guard against int overflow on (b-a) and on the step-count
+                 * multiply.  Prior code computed `c * MAX_SWEEP_STEPS` in int
+                 * and could wrap when c was large, silently passing sweeps
+                 * that flood.c would then truncate. */
+                long long planned = ((long long)b - (long long)a) / (long long)c + 1;
+                if (planned > MAX_SWEEP_STEPS)
+                    errx(1, "--sweep: %lld steps would exceed MAX_SWEEP_STEPS=%d — increase step",
+                         planned, MAX_SWEEP_STEPS);
                 conf.sweep_enabled = 1;
                 conf.sweep_start   = a;
                 conf.sweep_end     = b;

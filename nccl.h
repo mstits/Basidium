@@ -15,6 +15,7 @@
 #ifndef NCCL_MODULE_H
 #define NCCL_MODULE_H
 
+#include <stdatomic.h>
 #include <stddef.h>
 
 #define NCCL_MAX_RESULTS 16
@@ -35,8 +36,18 @@ struct nccl_result {
     double   time_us;        /* avg time in microseconds */
 };
 
+/*
+ * Concurrency invariant: `status` is _Atomic and is the publication point
+ * for the result-array writes.  The producer (nccl_run_thread) writes
+ * results[] and result_count, then stores status = NCCL_DONE.  Consumers
+ * (sweep/TCO/TUI/report) read status atomically; if they observe DONE,
+ * the prior result-array writes are guaranteed visible (seq_cst on the
+ * status store implies release semantics, and seq_cst on the consumer's
+ * load implies acquire — together they pair correctly even on weak-memory
+ * archs like ARM where v2.5's plain-int status read could race).
+ */
 struct nccl_state {
-    nccl_status_t    status;
+    _Atomic nccl_status_t status;
     char             binary[NCCL_BINARY_MAX];    /* path to nccl-tests binary */
     char             args[NCCL_ARGS_MAX];         /* extra args */
     struct nccl_result results[NCCL_MAX_RESULTS];

@@ -88,7 +88,16 @@ void profiles_dir(char *out, size_t len) {
     const char *home = getenv("HOME");
     if (!home) {
         struct passwd *pw = getpwuid(getuid());
-        home = pw ? pw->pw_dir : "/tmp";
+        home = pw ? pw->pw_dir : NULL;
+    }
+    if (!home) {
+        /* No HOME and getpwuid() failed.  Pre-v2.6 fell back to "/tmp",
+         * which is a symlink-following hazard when running as root: an
+         * attacker could pre-create /tmp/.basidium as a symlink elsewhere
+         * and redirect profile writes.  Refuse instead — callers see an
+         * empty string and bail out with a clear diagnostic. */
+        out[0] = '\0';
+        return;
     }
     char legacy[PROFILE_DIR_MAX];
     snprintf(legacy, sizeof(legacy), "%s/.basidium", home);
@@ -157,6 +166,10 @@ int profiles_save(const char *name, const struct config *cfg) {
 
     char dir[PROFILE_DIR_MAX];
     profiles_dir(dir, sizeof(dir));
+    if (dir[0] == '\0') {
+        fprintf(stderr, "profiles: HOME unset and getpwuid() failed — refusing /tmp fallback\n");
+        return -1;
+    }
     if (ensure_dir(dir) != 0) return -1;
 
     char path[PROFILE_DIR_MAX + PROFILE_NAME_MAX + 8];
@@ -213,6 +226,10 @@ int profiles_load(const char *name, struct config *cfg) {
 
     char dir[PROFILE_DIR_MAX];
     profiles_dir(dir, sizeof(dir));
+    if (dir[0] == '\0') {
+        fprintf(stderr, "profiles: HOME unset and getpwuid() failed — refusing /tmp fallback\n");
+        return -1;
+    }
 
     char path[PROFILE_DIR_MAX + PROFILE_NAME_MAX + 8];
     snprintf(path, sizeof(path), "%s/%s.conf", dir, name);
@@ -308,6 +325,7 @@ int profiles_load(const char *name, struct config *cfg) {
 int profiles_list(char names[PROFILE_LIST_MAX][PROFILE_NAME_MAX]) {
     char dir[PROFILE_DIR_MAX];
     profiles_dir(dir, sizeof(dir));
+    if (dir[0] == '\0') return 0;
 
     DIR *dp = opendir(dir);
     if (!dp) return 0;
@@ -317,12 +335,16 @@ int profiles_list(char names[PROFILE_LIST_MAX][PROFILE_NAME_MAX]) {
     while ((ent = readdir(dp)) && count < PROFILE_LIST_MAX) {
         if (ent->d_name[0] == '.') continue;
         size_t len = strlen(ent->d_name);
-        if (len > 5 && strcmp(ent->d_name + len - 5, ".conf") == 0) {
-            strncpy(names[count], ent->d_name, PROFILE_NAME_MAX - 1);
-            names[count][PROFILE_NAME_MAX - 1] = '\0';
-            names[count][len - 5] = '\0'; /* strip .conf */
-            count++;
-        }
+        if (len <= 5) continue;
+        if (strcmp(ent->d_name + len - 5, ".conf") != 0) continue;
+        /* Skip files whose basename (without .conf) won't fit; otherwise we
+         * would strncpy-truncate into PROFILE_NAME_MAX, then OOB-write the
+         * '\0' at index (len - 5) which can lie past the buffer. */
+        size_t basename_len = len - 5;
+        if (basename_len >= PROFILE_NAME_MAX) continue;
+        memcpy(names[count], ent->d_name, basename_len);
+        names[count][basename_len] = '\0';
+        count++;
     }
     closedir(dp);
     return count;

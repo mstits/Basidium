@@ -218,29 +218,19 @@ void *sniffer_thread_func(void *arg) {
         return NULL;
     }
 
-    /* BPF filter: exclude our own injected traffic by filtering out frames
-     * with our probe signature in the IP ID field.  Without the filter,
-     * fail-open detection sees every injected frame come back via the
-     * loopback path that some libpcap captures expose, producing false
-     * positives.  If pcap_compile fails we treat the sniffer as broken
-     * rather than producing misleading detections. */
-    struct bpf_program bpf;
-    char filter[128];
-    snprintf(filter, sizeof(filter),
-             "not (ip and ip[4:2] = 0x%04x)", probe_signature);
-    if (pcap_compile(sniffer, &bpf, filter, 1, PCAP_NETMASK_UNKNOWN) != 0) {
-        warnx("Sniffer BPF compile failed: %s — disabling --detect / -L / -A",
-              pcap_geterr(sniffer));
-        pcap_close(sniffer);
-        return NULL;
-    }
-    if (pcap_setfilter(sniffer, &bpf) != 0) {
-        warnx("Sniffer BPF setfilter failed: %s", pcap_geterr(sniffer));
-        pcap_freecode(&bpf);
-        pcap_close(sniffer);
-        return NULL;
-    }
-    pcap_freecode(&bpf);
+    /* No BPF filter installed: --detect needs to see frames echoed by a
+     * fail-open switch, and those frames carry our probe signature.  An
+     * earlier filter ("not (ip and ip[4:2] = probe)") dropped them in an
+     * attempt to suppress macOS BPF's TX-loopback echoes — but it also
+     * dropped the very frames the feature is trying to catch, silently
+     * defeating --detect on every platform.
+     *
+     * On Linux raw sockets, libpcap does not echo our injected TX into the
+     * local capture stream, so a frame with our probe signature genuinely
+     * came back from the wire (i.e. the switch is flooding it).  On macOS
+     * BPF, TX frames *are* captured locally, which produces constant false
+     * positives.  README documents the macOS limitation; a real fix waits
+     * on the v2.7 receiver-mode design. */
 
     struct pcap_pkthdr *hdr;
     const u_char *pkt;
@@ -265,12 +255,20 @@ void *sniffer_thread_func(void *arg) {
         /* Fail-open detection: MAC-flood frames embed probe_signature in ip_id.
          * If we receive an IP frame with our own probe_signature, the switch
          * is broadcasting our injected traffic — it has failed open to hub mode.
-         * Note: with the BPF filter active, this branch only fires if the filter
-         * could not be installed (pcap_compile failure). */
+         * Linux raw sockets: reliable (libpcap does not echo our TX).
+         * macOS BPF: this fires on every run because TX is captured locally;
+         * --detect is documented as Linux-only until v2.7's receiver mode lands.
+         *
+         * Read ip_id via memcpy: pkt is libpcap-managed and may not be aligned
+         * to struct ip's 4-byte requirement, so a struct-pointer dereference
+         * would be UB on strict-alignment cores. */
         if (conf.detect_failopen && !fail_open_detected &&
                 ntohs(eth->type) == ETHERTYPE_IP && hdr->caplen >= 34) {
-            struct ip *iph = (struct ip *)(pkt + sizeof(struct ether_header_custom));
-            if (ntohs(iph->ip_id) == probe_signature) {
+            uint16_t ip_id_net;
+            memcpy(&ip_id_net,
+                   pkt + sizeof(struct ether_header_custom) + 4,
+                   sizeof(ip_id_net));
+            if (ntohs(ip_id_net) == probe_signature) {
                 atomic_store(&fail_open_detected, 1);
                 log_event("FAIL_OPEN",
                           "Switch fail-open detected — injected frames echoed back");
@@ -294,6 +292,10 @@ void *sniffer_thread_func(void *arg) {
 
 void vlan_tag_frame(uint8_t *buffer, int *len, struct rng_state *rng) {
     if (!conf.vlan_id) return;
+    /* Refuse to grow past the worker's MAX_PACKET_SIZE-sized stack buffer.
+     * Without this guard, `-J 9216 -V N --qinq M` overflowed the buffer by
+     * 4–8 bytes (ASan-confirmed stack-buffer-overflow at flood.c:289). */
+    if (*len + 4 > MAX_PACKET_SIZE) return;
 
     memmove(buffer + 16, buffer + 12, *len - 12);
 
@@ -313,6 +315,7 @@ void vlan_tag_frame(uint8_t *buffer, int *len, struct rng_state *rng) {
 
 void qinq_tag_frame(uint8_t *buffer, int *len) {
     if (!conf.qinq_outer_vid) return;
+    if (*len + 4 > MAX_PACKET_SIZE) return;  /* same overflow guard as vlan_tag */
 
     memmove(buffer + 16, buffer + 12, *len - 12);
 
@@ -362,8 +365,13 @@ int build_packet_mac(uint8_t *buffer, struct rng_state *rng) {
 
     struct ip *iph = (struct ip *)(buffer + sizeof(struct ether_header_custom));
     int frame_len = (conf.packet_size > 60) ? conf.packet_size : 60;
-    if (frame_len > MAX_PACKET_SIZE)
-        frame_len = MAX_PACKET_SIZE;
+    /* Reserve room for VLAN/QinQ tags (4 bytes each).  Without this, a user
+     * specifying -J at the buffer max plus VLAN would have the tag silently
+     * dropped by the per-tag overflow guard.  Capping here lets us keep the
+     * tag while shrinking payload by the same 4–8 bytes. */
+    int tag_overhead = (conf.vlan_id ? 4 : 0) + (conf.qinq_outer_vid ? 4 : 0);
+    if (frame_len > MAX_PACKET_SIZE - tag_overhead)
+        frame_len = MAX_PACKET_SIZE - tag_overhead;
 
     /* Zero before populating — the buffer is reused across iterations and
      * across mode switches under TCO, so ip_tos / ip_off / ip_p can carry
@@ -514,10 +522,17 @@ int build_packet_nd(uint8_t *buffer, struct rng_state *rng) {
     ip6->src[14] = src_mac[4];
     ip6->src[15] = src_mac[5];
 
-    ip6->dst[0]  = 0xff; ip6->dst[1]  = 0x02;
-    memset(ip6->dst + 2, 0, 9);
-    ip6->dst[11] = 0x00; ip6->dst[12] = 0x01;
-    ip6->dst[13] = 0xff;
+    /* RFC 4291 §2.7.1 solicited-node multicast: ff02::1:ff{low 24 bits of target}.
+     * Wire layout is ff 02 00 00 00 00 00 00 00 00 00 01 ff XX YY ZZ where
+     * XX,YY,ZZ are target's low 24 bits.  Earlier code shifted the 0x01 marker
+     * one byte right (landing it at byte 12 instead of 11) and read only the
+     * low 16 bits of the target, producing a malformed sol-node address. */
+    memset(ip6->dst, 0, 16);
+    ip6->dst[0]  = 0xff;
+    ip6->dst[1]  = 0x02;
+    ip6->dst[11] = 0x01;
+    ip6->dst[12] = 0xff;
+    ip6->dst[13] = target_ip6[13];
     ip6->dst[14] = target_ip6[14];
     ip6->dst[15] = target_ip6[15];
 
@@ -693,14 +708,23 @@ void *worker_func(void *arg) {
         }
     }
 
-    uint8_t buffer[MAX_PACKET_SIZE];
+    /* Align so the IP header (offset 14 = 4n+2 mod 4 from a naive base)
+     * lands at a 4-byte-aligned address.  `struct ip` from <netinet/ip.h>
+     * requires 4-byte alignment for its uint32_t members; without this
+     * trick UBSan flags every iph->* assignment as misaligned access on
+     * aarch64.  Backing is 4-aligned, +2 puts data start at 4n+2, +14
+     * (eth header) puts iph at 4n+16 = 4-aligned. */
+    _Alignas(4) uint8_t buf_backing[MAX_PACKET_SIZE + 2];
+    uint8_t *buffer = buf_backing + 2;
     memset(buffer, 0, MAX_PACKET_SIZE);
     int len = 0;
     struct rng_state rng;
     rng_init(&rng, thread_id);
 
-    flood_mode_t cur_mode = conf.mode;
-    len = build_for_mode(buffer, &rng, cur_mode);
+    /* Initial cur_mode = INVALID forces the first loop iteration to build
+     * fresh, eliminating wasted RNG draws when --scenario is set and TCO
+     * has already moved conf.mode to step 0 by the time we get here. */
+    flood_mode_t cur_mode = MODE_INVALID;
 
     struct ether_header_custom *eth = (struct ether_header_custom *)buffer;
     uint64_t local_sent       = 0;
@@ -816,10 +840,18 @@ void *worker_func(void *arg) {
                 clock_gettime(CLOCK_MONOTONIC, &next_tx);
                 last_pps_seen = cur_pps;
             }
-            uint64_t per_thread_pps = (uint64_t)cur_pps / (uint64_t)conf.threads;
-            if (per_thread_pps == 0) per_thread_pps = 1;
-            uint64_t ns = 1000000000ULL / per_thread_pps;
-            next_tx.tv_nsec += (long)ns;
+            /* Per-thread inter-packet interval = 1e9 ns × threads / total_pps.
+             * Compute the period directly so cur_pps < threads still produces
+             * the correct multi-second interval — earlier code did
+             * `per_thread_pps = cur_pps / threads`, which floored to 0 then
+             * was clamped to 1 (giving ns=1e9 regardless), so e.g. `-r 5 -t 16`
+             * actually emitted 16 pps instead of 5. */
+            uint64_t period_ns = (1000000000ULL * (uint64_t)conf.threads) /
+                                 (uint64_t)cur_pps;
+            /* Split into seconds + ns before adding to tv_nsec so a multi-second
+             * period (cur_pps < threads) doesn't overflow `long` on 32-bit. */
+            next_tx.tv_sec  += (time_t)(period_ns / 1000000000ULL);
+            next_tx.tv_nsec += (long)(period_ns % 1000000000ULL);
             while (next_tx.tv_nsec >= 1000000000L) {
                 next_tx.tv_nsec -= 1000000000L;
                 next_tx.tv_sec  += 1;
@@ -902,11 +934,20 @@ void *pcap_replay_func(void *arg) {
     struct pcap_pkthdr *hdr;
     const u_char *data;
     int rc;
+    int warned = 0;
 
     while (is_running && (rc = pcap_next_ex(replay, &hdr, &data)) >= 0) {
         if (rc == 0) continue;
-        pcap_inject(inj, data, hdr->caplen);
-        atomic_fetch_add(&total_sent, 1);
+        int sent = pcap_inject(inj, data, hdr->caplen);
+        if (sent >= (int)hdr->caplen) {
+            atomic_fetch_add(&total_sent, 1);
+        } else if (!warned) {
+            /* pcap_inject can fail (frame too large, NIC down, EINTR).
+             * Surface it once instead of silently inflating total_sent for
+             * every dropped frame the way pre-v2.6 did. */
+            warnx("pcap replay: pcap_inject failed: %s", pcap_geterr(inj));
+            warned = 1;
+        }
         int cur_pps = conf.pps;
         if (cur_pps > 0)
             usleep(1000000u / (unsigned)cur_pps);
@@ -1038,6 +1079,11 @@ void *sweep_thread_func(void *arg) {
                      step + 1, total, pps, sweep_step_pps[step]);
         }
         log_event("SWEEP_STEP", msg);
+
+        /* Mark this step's data as recorded.  write_report iterates up to
+         * sweep_steps_completed so a halted sweep no longer emits zeroed
+         * phantom rows for steps that never ran. */
+        atomic_store(&sweep_steps_completed, step + 1);
     }
 
     log_event("SWEEP_DONE", "Rate sweep completed");
@@ -1049,13 +1095,16 @@ void *sweep_thread_func(void *arg) {
 
 int run_selftest(void) {
     printf("Running Self-Test Suite...\n");
-    uint8_t buf[MAX_PACKET_SIZE];
+    /* Same alignment trick as worker_func — IP header at offset 14 must
+     * be 4-byte-aligned for the (struct ip *) cast to be defined. */
+    _Alignas(4) uint8_t buf_backing[MAX_PACKET_SIZE + 2];
+    uint8_t *buf = buf_backing + 2;
     int len;
     struct rng_state rng;
     rng_init(&rng, 42);
 
     /* Test 1: MAC */
-    memset(buf, 0, sizeof(buf));
+    memset(buf, 0, MAX_PACKET_SIZE);
     len = build_packet_mac(buf, &rng);
     if (len < 60) errx(1, "FAIL: MAC packet too small (%d)", len);
     struct ether_header_custom *eth = (struct ether_header_custom *)buf;
@@ -1067,7 +1116,7 @@ int run_selftest(void) {
     printf("[PASS] MAC Builder (with IP checksum)\n");
 
     /* Test 2: ARP */
-    memset(buf, 0, sizeof(buf));
+    memset(buf, 0, MAX_PACKET_SIZE);
     build_packet_arp(buf, &rng);
     eth = (struct ether_header_custom *)buf;
     if (ntohs(eth->type) != ETHERTYPE_ARP) errx(1, "FAIL: ARP ethertype incorrect");
@@ -1076,7 +1125,7 @@ int run_selftest(void) {
     printf("[PASS] ARP Builder\n");
 
     /* Test 3: DHCP */
-    memset(buf, 0, sizeof(buf));
+    memset(buf, 0, MAX_PACKET_SIZE);
     build_packet_dhcp(buf, &rng);
     eth = (struct ether_header_custom *)buf;
     struct ip *iph = (struct ip *)(buf + sizeof(*eth));
@@ -1089,7 +1138,7 @@ int run_selftest(void) {
     printf("[PASS] DHCP Builder\n");
 
     /* Test 4: 802.1Q VLAN tagging */
-    memset(buf, 0, sizeof(buf));
+    memset(buf, 0, MAX_PACKET_SIZE);
     conf.vlan_id  = 100;
     conf.vlan_pcp = 5;
     int base_len = build_packet_mac(buf, &rng);
@@ -1111,7 +1160,7 @@ int run_selftest(void) {
     printf("[PASS] VLAN Tagging\n");
 
     /* Test 5: PFC PAUSE frame */
-    memset(buf, 0, sizeof(buf));
+    memset(buf, 0, MAX_PACKET_SIZE);
     conf.pfc_priority = 3;
     conf.pfc_quanta   = 0xFFFF;
     int pfc_len = build_packet_pfc(buf, &rng);
@@ -1143,7 +1192,7 @@ int run_selftest(void) {
     printf("[PASS] PFC Builder\n");
 
     /* Test 6: IPv6 ND */
-    memset(buf, 0, sizeof(buf));
+    memset(buf, 0, MAX_PACKET_SIZE);
     int nd_len = build_packet_nd(buf, &rng);
     eth = (struct ether_header_custom *)buf;
     if (ntohs(eth->type) != 0x86DD)
@@ -1159,12 +1208,24 @@ int run_selftest(void) {
         (struct icmpv6_ns_pkt *)(buf + sizeof(*eth) + sizeof(struct ipv6_header));
     if (ns_test->type != 135)
         errx(1, "FAIL: ND ICMPv6 type not 135");
+    /* Solicited-node multicast layout (RFC 4291): ff02::1:ff + target's low 24 bits */
+    if (ip6nd->dst[0] != 0xff || ip6nd->dst[1] != 0x02)
+        errx(1, "FAIL: ND IPv6 dst prefix not ff02::");
+    if (ip6nd->dst[11] != 0x01)
+        errx(1, "FAIL: ND IPv6 dst byte 11=0x%02x (expected 0x01)", ip6nd->dst[11]);
+    if (ip6nd->dst[12] != 0xff)
+        errx(1, "FAIL: ND IPv6 dst byte 12=0x%02x (expected 0xff)", ip6nd->dst[12]);
+    if (memcmp(ip6nd->dst + 13, ns_test->target + 13, 3) != 0)
+        errx(1, "FAIL: ND IPv6 dst low 24 bits do not match target's low 24 bits");
+    /* Ethernet sol-node MAC (33:33:ff:XX:YY:ZZ) must mirror the same low 24 bits */
+    if (memcmp(eth->dest + 3, ns_test->target + 13, 3) != 0)
+        errx(1, "FAIL: ND L2 sol-node MAC does not match target's low 24 bits");
     if (nd_len != 86)
         errx(1, "FAIL: ND frame length %d (expected 86)", nd_len);
     printf("[PASS] ND Builder\n");
 
     /* Test 7: LLDP */
-    memset(buf, 0, sizeof(buf));
+    memset(buf, 0, MAX_PACKET_SIZE);
     int lldp_len = build_packet_lldp(buf, &rng);
     eth = (struct ether_header_custom *)buf;
     static const uint8_t lldp_dst_exp[6] = {0x01, 0x80, 0xC2, 0x00, 0x00, 0x0E};
@@ -1181,7 +1242,7 @@ int run_selftest(void) {
     printf("[PASS] LLDP Builder\n");
 
     /* Test 8: STP TCN BPDU */
-    memset(buf, 0, sizeof(buf));
+    memset(buf, 0, MAX_PACKET_SIZE);
     int stp_len = build_packet_stp(buf, &rng);
     eth = (struct ether_header_custom *)buf;
     static const uint8_t stp_dst_exp[6] = {0x01, 0x80, 0xC2, 0x00, 0x00, 0x00};
@@ -1199,7 +1260,7 @@ int run_selftest(void) {
     printf("[PASS] STP TCN Builder\n");
 
     /* Test 9: QinQ double-tagging */
-    memset(buf, 0, sizeof(buf));
+    memset(buf, 0, MAX_PACKET_SIZE);
     conf.vlan_id       = 100;
     conf.qinq_outer_vid = 200;
     int qq_len = build_packet_mac(buf, &rng);
@@ -1222,7 +1283,7 @@ int run_selftest(void) {
     printf("[PASS] QinQ Double-Tag\n");
 
     /* Test 10: IGMP Membership Report */
-    memset(buf, 0, sizeof(buf));
+    memset(buf, 0, MAX_PACKET_SIZE);
     int igmp_len = build_packet_igmp(buf, &rng);
     eth = (struct ether_header_custom *)buf;
     if (eth->dest[0] != 0x01 || eth->dest[1] != 0x00 || eth->dest[2] != 0x5E)
@@ -1242,7 +1303,7 @@ int run_selftest(void) {
     printf("[PASS] IGMP Builder\n");
 
     /* Test 11: payload pattern */
-    memset(buf, 0, sizeof(buf));
+    memset(buf, 0, MAX_PACKET_SIZE);
     conf.packet_size   = 128;
     conf.payload_pattern = 2;
     int pl_len = build_packet_mac(buf, &rng);

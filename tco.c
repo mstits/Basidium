@@ -23,8 +23,9 @@
 
 struct tco_scenario     tco_scenario;
 struct tco_step_result  tco_results[TCO_MAX_STEPS];
-atomic_int              tco_current_step = 0;
-atomic_int              tco_step_rem     = 0;
+atomic_int              tco_current_step    = 0;
+atomic_int              tco_steps_completed = 0;
+atomic_int              tco_step_rem        = 0;
 
 /* ---- scenario parser ---- */
 
@@ -199,6 +200,22 @@ void *tco_thread_func(void *arg) {
                 /* Auto-set baseline from first successful measurement */
                 if (nccl.baseline_bus_bw <= 0.0)
                     nccl_set_baseline();
+
+                /* --stop-on-degradation halts the scenario when bandwidth drops
+                 * past the operator's threshold (negative percent, e.g. -30 means
+                 * stop at 30% degradation).  Mirrors sweep_thread_func's gate so
+                 * a TCO scenario can fail-fast in CI on regression. */
+                if (conf.stop_on_degradation_pct < 0.0 &&
+                        nccl.baseline_bus_bw > 0.0) {
+                    double delta = ((tco_results[i].nccl_busbw
+                                     - nccl.baseline_bus_bw)
+                                    / nccl.baseline_bus_bw) * 100.0;
+                    if (delta <= conf.stop_on_degradation_pct) {
+                        log_event("TCO_STOP",
+                                  "stop-on-degradation threshold reached");
+                        atomic_store(&is_running, 0);
+                    }
+                }
             }
         }
 
@@ -215,6 +232,11 @@ void *tco_thread_func(void *arg) {
                      i + 1, tco_results[i].achieved_pps);
         }
         log_event("TCO_STEP_DONE", msg);
+
+        /* Mark this step's data as recorded.  write_report iterates up to
+         * tco_steps_completed so a halted scenario no longer emits zeroed
+         * phantom rows for steps that never ran. */
+        atomic_store(&tco_steps_completed, i + 1);
     }
 
     log_event("TCO_DONE", "Scenario completed");

@@ -84,9 +84,13 @@ int write_report(const char *path, const struct nic_stats *final_nic) {
     fprintf(fp, "  \"peak_pps\": %llu,\n",
             (unsigned long long)peak_pps);
 
-    /* rate sweep results */
-    int nsteps = (int)sweep_total_steps;
-    if (conf.sweep_enabled && nsteps > 0) {
+    /* rate sweep results.  We emit metadata if the sweep was attempted
+     * (sweep_total_steps > 0), but the steps array only contains entries
+     * with recorded data — sweep_steps_completed tracks how far we actually
+     * got, so a halted run (--stop-on-* / SIGINT) doesn't emit zeroed rows. */
+    int nsteps_planned = (int)sweep_total_steps;
+    int nsteps         = (int)sweep_steps_completed;
+    if (conf.sweep_enabled && nsteps_planned > 0) {
         fprintf(fp, "  \"sweep\": {\n");
         fprintf(fp, "    \"start\": %d,\n",   conf.sweep_start);
         fprintf(fp, "    \"end\": %d,\n",     conf.sweep_end);
@@ -95,6 +99,9 @@ int write_report(const char *path, const struct nic_stats *final_nic) {
         if (conf.nccl && nccl.baseline_bus_bw > 0.0)
             fprintf(fp, "    \"nccl_baseline_busbw\": %.2f,\n",
                     nccl.baseline_bus_bw);
+        if (nsteps < nsteps_planned)
+            fprintf(fp, "    \"halted_early\": true,\n"
+                        "    \"steps_planned\": %d,\n", nsteps_planned);
         fprintf(fp, "    \"steps\": [\n");
         int pps = conf.sweep_start;
         for (int i = 0; i < nsteps; i++, pps += conf.sweep_step) {
@@ -127,8 +134,13 @@ int write_report(const char *path, const struct nic_stats *final_nic) {
         fprintf(fp, "  \"sweep\": null,\n");
     }
 
-    /* TCO scenario results */
+    /* TCO scenario results.  Like the sweep block, we emit scenario metadata
+     * if the scenario file parsed (step_count > 0), but the steps array only
+     * contains steps that actually completed (tco_steps_completed). */
     if (conf.scenario_file && tco_scenario.step_count > 0) {
+        int tsteps_planned   = tco_scenario.step_count;
+        int tsteps_completed = (int)tco_steps_completed;
+        if (tsteps_completed > tsteps_planned) tsteps_completed = tsteps_planned;
         fprintf(fp, "  \"scenario\": {\n");
         fprintf(fp, "    \"name\": ");
         write_esc(fp, tco_scenario.name);
@@ -139,8 +151,11 @@ int write_report(const char *path, const struct nic_stats *final_nic) {
         if (conf.nccl && nccl.baseline_bus_bw > 0.0)
             fprintf(fp, "    \"nccl_baseline_busbw\": %.2f,\n",
                     nccl.baseline_bus_bw);
+        if (tsteps_completed < tsteps_planned)
+            fprintf(fp, "    \"halted_early\": true,\n"
+                        "    \"steps_planned\": %d,\n", tsteps_planned);
         fprintf(fp, "    \"steps\": [\n");
-        for (int i = 0; i < tco_scenario.step_count; i++) {
+        for (int i = 0; i < tsteps_completed; i++) {
             struct tco_step *st = &tco_scenario.steps[i];
             fprintf(fp, "      {\"mode\": \"%s\", \"pps_target\": %d, "
                     "\"duration_s\": %d, \"pps_achieved\": %llu",
@@ -166,7 +181,7 @@ int write_report(const char *path, const struct nic_stats *final_nic) {
                         (unsigned long long)tco_results[i].nic_delta.tx_errors);
             }
             fprintf(fp, "}%s\n",
-                    (i < tco_scenario.step_count - 1) ? "," : "");
+                    (i < tsteps_completed - 1) ? "," : "");
         }
         fprintf(fp, "    ]\n");
         fprintf(fp, "  },\n");
@@ -304,9 +319,11 @@ int write_csv(const char *path) {
     int wrote = 0;
 
     /* Sweep steps share a single mode (conf.mode) — write that on every row
-     * so a CSV viewer can group/filter without inferring it from the report. */
-    if (conf.sweep_enabled && (int)sweep_total_steps > 0) {
-        int nsteps = (int)sweep_total_steps;
+     * so a CSV viewer can group/filter without inferring it from the report.
+     * Iterate up to sweep_steps_completed so a halted run doesn't produce
+     * zeroed phantom rows. */
+    if (conf.sweep_enabled && (int)sweep_steps_completed > 0) {
+        int nsteps = (int)sweep_steps_completed;
         int pps = conf.sweep_start;
         for (int i = 0; i < nsteps; i++, pps += conf.sweep_step) {
             fprintf(fp, "%d,%s,%d,%llu,",
@@ -335,9 +352,12 @@ int write_csv(const char *path) {
         }
     }
 
-    /* Scenario steps each carry their own mode. */
-    if (conf.scenario_file && tco_scenario.step_count > 0) {
-        for (int i = 0; i < tco_scenario.step_count; i++) {
+    /* Scenario steps each carry their own mode.  Use tco_steps_completed
+     * so partial scenarios omit phantom rows. */
+    if (conf.scenario_file && (int)tco_steps_completed > 0) {
+        int tsteps = (int)tco_steps_completed;
+        if (tsteps > tco_scenario.step_count) tsteps = tco_scenario.step_count;
+        for (int i = 0; i < tsteps; i++) {
             struct tco_step *st = &tco_scenario.steps[i];
             fprintf(fp, "%d,%s,%d,%llu,",
                     i + 1, mode_to_string(st->mode), st->pps,

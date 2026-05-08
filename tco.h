@@ -58,6 +58,7 @@ struct tco_step_result {
 extern struct tco_scenario     tco_scenario;
 extern struct tco_step_result  tco_results[TCO_MAX_STEPS];
 extern atomic_int              tco_current_step;   /* 1-indexed for display */
+extern atomic_int              tco_steps_completed; /* steps with recorded data */
 extern atomic_int              tco_step_rem;       /* seconds remaining */
 
 /* ---- API ---- */

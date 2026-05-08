@@ -15,9 +15,12 @@
 #include "nccl.h"
 
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 struct nccl_state nccl = {
     .status         = NCCL_IDLE,
@@ -61,24 +64,82 @@ int nccl_parse_line(const char *line, struct nccl_result *out) {
     return 1;
 }
 
+static void nccl_set_error(const char *fmt, ...)
+    __attribute__((format(printf, 1, 2)));
+static void nccl_set_error(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    pthread_mutex_lock(&nccl_mutex);
+    nccl.status = NCCL_ERROR;
+    vsnprintf(nccl.last_error, sizeof(nccl.last_error), fmt, ap);
+    pthread_mutex_unlock(&nccl_mutex);
+    va_end(ap);
+}
+
 static void *nccl_run_thread(void *arg) {
     (void)arg;
-    char cmd[NCCL_BINARY_MAX + NCCL_ARGS_MAX + 8];
-    snprintf(cmd, sizeof(cmd), "%s %s 2>&1", nccl.binary, nccl.args);
 
-    FILE *fp = popen(cmd, "r");
+    /* Spawn nccl-tests via fork+execvp instead of popen()+sh.  Earlier code
+     * built `"%s %s 2>&1"` and handed it to popen, which runs it through
+     * /bin/sh -c.  That meant any shell metacharacter ($, ;, &, `, |, etc.)
+     * inside --nccl-binary or --nccl args would be evaluated by the shell.
+     * --nccl-binary is user-supplied today, but the same field is loaded
+     * verbatim from --profile files and could grow other ingestion paths
+     * later.  Routing through execvp removes the shell entirely. */
+    char args_copy[NCCL_ARGS_MAX];
+    snprintf(args_copy, sizeof(args_copy), "%s", nccl.args);
+
+    char *argv[64];
+    int argc = 0;
+    argv[argc++] = nccl.binary;
+    char *saveptr = NULL;
+    char *tok = strtok_r(args_copy, " \t", &saveptr);
+    while (tok && argc < (int)(sizeof(argv) / sizeof(argv[0])) - 1) {
+        argv[argc++] = tok;
+        tok = strtok_r(NULL, " \t", &saveptr);
+    }
+    argv[argc] = NULL;
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        nccl_set_error("pipe() failed");
+        return NULL;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        nccl_set_error("fork() failed");
+        return NULL;
+    }
+
+    if (pid == 0) {
+        /* Child: redirect stdout+stderr into the pipe, then exec.  Only
+         * async-signal-safe calls between fork() and exec(): close, dup2,
+         * execvp.  No malloc, no stdio. */
+        close(pipefd[0]);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0) _exit(126);
+        if (dup2(pipefd[1], STDERR_FILENO) < 0) _exit(126);
+        close(pipefd[1]);
+        execvp(nccl.binary, argv);
+        _exit(127); /* exec failed — 127 mirrors shell convention */
+    }
+
+    /* Parent: read from the pipe until EOF, then wait. */
+    close(pipefd[1]);
+    FILE *fp = fdopen(pipefd[0], "r");
     if (!fp) {
-        pthread_mutex_lock(&nccl_mutex);
-        nccl.status = NCCL_ERROR;
-        snprintf(nccl.last_error, sizeof(nccl.last_error), "popen failed");
-        pthread_mutex_unlock(&nccl_mutex);
+        close(pipefd[0]);
+        int status;
+        waitpid(pid, &status, 0);
+        nccl_set_error("fdopen() failed");
         return NULL;
     }
 
     char line[512];
     struct nccl_result results[NCCL_MAX_RESULTS];
     int count = 0;
-
     while (fgets(line, sizeof(line), fp)) {
         if (count >= NCCL_MAX_RESULTS)
             break;
@@ -86,8 +147,14 @@ static void *nccl_run_thread(void *arg) {
         if (nccl_parse_line(line, &r))
             results[count++] = r;
     }
+    fclose(fp);
 
-    int rc = pclose(fp);
+    int wstatus = 0;
+    waitpid(pid, &wstatus, 0);
+    int rc;
+    if      (WIFEXITED(wstatus))   rc = WEXITSTATUS(wstatus);
+    else if (WIFSIGNALED(wstatus)) rc = 128 + WTERMSIG(wstatus);
+    else                           rc = -1;
 
     pthread_mutex_lock(&nccl_mutex);
     if (rc != 0 && count == 0) {

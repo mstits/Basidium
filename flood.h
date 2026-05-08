@@ -224,6 +224,7 @@ extern atomic_int        fail_open_detected;
 /* sweep state — updated by sweep_thread_func, read by TUI */
 extern atomic_int        sweep_step_num;
 extern atomic_int        sweep_total_steps;
+extern atomic_int        sweep_steps_completed; /* set at end of each step's recording */
 extern atomic_int        sweep_hold_rem; /* seconds left in current hold */
 extern atomic_ullong     thread_sent[MAX_THREADS]; /* per-thread counters */
 extern atomic_ullong     bcast_rx;                 /* sniffer: bcast frames seen */

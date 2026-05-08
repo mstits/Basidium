@@ -23,6 +23,7 @@
 #include "profiles.h"
 #include "nic_stats.h"
 
+#include <limits.h>
 #include <ncurses.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -296,15 +297,23 @@ void tui_init(void) {
         char dir[PROFILE_DIR_MAX];
         char path[PROFILE_DIR_MAX + 28];
         profiles_dir(dir, sizeof(dir));
+        /* If profiles_dir refused (no HOME, no passwd), skip the marker dance.
+         * Otherwise we'd format paths starting with "/" and try to write
+         * "/.disclaimer_accepted" — harmless for non-root, an annoying file
+         * pollution as root. */
+        if (dir[0] != '\0') {
+            snprintf(path, sizeof(path), "%s/.disclaimer_accepted", dir);
+            if (access(path, F_OK) != 0)
+                show_disclaimer = 1;
 
-        snprintf(path, sizeof(path), "%s/.disclaimer_accepted", dir);
-        if (access(path, F_OK) != 0)
+            snprintf(path, sizeof(path), "%s/.tui_intro_seen", dir);
+            if (access(path, F_OK) != 0) {
+                show_intro = 1;
+                intro_page = 0;
+            }
+        } else {
+            /* Always show disclaimer when we can't persist acceptance */
             show_disclaimer = 1;
-
-        snprintf(path, sizeof(path), "%s/.tui_intro_seen", dir);
-        if (access(path, F_OK) != 0) {
-            show_intro = 1;
-            intro_page = 0;
         }
     }
 }
@@ -393,9 +402,11 @@ static void draw_disclaimer(void) {
         char dir[PROFILE_DIR_MAX];
         char path[PROFILE_DIR_MAX + 28];
         profiles_dir(dir, sizeof(dir));
-        snprintf(path, sizeof(path), "%s/.disclaimer_accepted", dir);
-        FILE *f = fopen(path, "w");
-        if (f) { fputs("1\n", f); fclose(f); }
+        if (dir[0] != '\0') {
+            snprintf(path, sizeof(path), "%s/.disclaimer_accepted", dir);
+            FILE *f = fopen(path, "w");
+            if (f) { fputs("1\n", f); fclose(f); }
+        }
         show_disclaimer = 0;
     } else {
         /* User declined — shut down cleanly */
@@ -413,6 +424,7 @@ static void intro_mark_seen(void) {
     char dir[PROFILE_DIR_MAX];
     char path[PROFILE_DIR_MAX + 24];
     profiles_dir(dir, sizeof(dir));
+    if (dir[0] == '\0') return;
     snprintf(path, sizeof(path), "%s/.tui_intro_seen", dir);
     FILE *f = fopen(path, "w");
     if (f) { fputs("1\n", f); fclose(f); }
@@ -1224,13 +1236,15 @@ int tui_input(int ch) {
         break;
 
     case '+': case '=':
-        conf.pps = (conf.pps <= 0) ? 1000 : conf.pps + 1000;
+        if (conf.pps <= 0)              conf.pps = 1000;
+        else if (conf.pps > INT_MAX - 1000) conf.pps = INT_MAX;
+        else                            conf.pps += 1000;
         tui_log("Rate: %d pps", conf.pps);
         break;
 
     case '-':
-        conf.pps -= 1000;
-        if (conf.pps < 0) conf.pps = 0;
+        if (conf.pps <= 1000) conf.pps = 0;
+        else                  conf.pps -= 1000;
         tui_log("Rate: %s", conf.pps ? "" : "unlimited");
         if (conf.pps) tui_log("%d pps", conf.pps);
         break;
