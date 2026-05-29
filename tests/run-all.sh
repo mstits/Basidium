@@ -469,6 +469,26 @@ assert_exit "diff: missing file → exit 1"          1 $BIN --diff "$TMP/no-such
 assert_exit "diff: missing args → errx"            1 $BIN --diff
 assert_exit "diff: malformed unknown opt"          1 $BIN --diff a b --bogus
 
+# Phantom-step regression: the step-array parser must stop at the closing ']'
+# and NOT parse the trailing "nccl": {...} / "nic_stats": {...} objects (and
+# the nested per-step "nic_delta": {...}) as extra all-zero steps.  A report
+# with both trailing objects and nic_delta on every step must still diff to
+# exactly the two real steps.
+cat > "$TMP/d-trailing.json" <<'EOF'
+{
+  "mode": "mac",
+  "sweep": {"start": 1000, "end": 2000, "step": 1000, "hold_s": 10, "steps": [
+    {"pps_target": 1000, "pps_achieved": 990,  "nccl_busbw": 100.0, "nic_delta": {"tx_packets": 9900,  "tx_bytes": 6, "tx_dropped": 0, "tx_errors": 0}},
+    {"pps_target": 2000, "pps_achieved": 1980, "nccl_busbw": 95.0,  "nic_delta": {"tx_packets": 19800, "tx_bytes": 6, "tx_dropped": 0, "tx_errors": 0}}
+  ]},
+  "scenario": null,
+  "nccl": {"binary": "/x", "last_busbw_gbps": 95.0, "last_algbw_gbps": 47.5, "runs": 2},
+  "nic_stats": {"tx_packets": 100, "tx_bytes": 6400, "tx_dropped": 0, "tx_errors": 0}
+}
+EOF
+rows=$($BIN --diff "$TMP/d-trailing.json" "$TMP/d-trailing.json" | grep -cE '^[0-9]')
+assert_eq "diff parses exactly 2 real steps (no phantom nccl/nic_stats rows)" 2 "$rows"
+
 # ------------------------------------------------------------------
 section "15. Signal handling"
 # ------------------------------------------------------------------
@@ -628,6 +648,76 @@ else
 fi
 make clean > /dev/null 2>&1
 make > /dev/null 2>&1
+
+# ------------------------------------------------------------------
+section "19. --report optional-argument forms"
+# ------------------------------------------------------------------
+# getopt only binds an optional argument via --report=FILE.  Pre-fix the
+# documented space form (--report FILE) silently dropped the path and
+# auto-named a timestamped file; now it lands in the named file.
+rm -f "$TMP"/rep-*.json
+$BIN --dry-run -M mac -n 5 --report "$TMP/rep-space.json" > /dev/null 2>&1
+assert_file_nonempty "--report FILE (space form) writes the named file"  "$TMP/rep-space.json"
+$BIN --dry-run -M mac -n 5 --report="$TMP/rep-eq.json"    > /dev/null 2>&1
+assert_file_nonempty "--report=FILE (equals form) writes the named file" "$TMP/rep-eq.json"
+# A stray positional argument is now a loud error, not silently ignored.
+assert_exit "stray positional argument rejected" 1 $BIN --dry-run -M mac -n 5 bogus_positional
+
+# ------------------------------------------------------------------
+section "20. PPS counter accuracy at low rate (quantization regression)"
+# ------------------------------------------------------------------
+# Pre-fix, unbounded runs only flushed total_sent in 1024-packet batches, so a
+# sweep step that sent fewer than 1024 packets in its window recorded
+# pps_achieved=0 (and larger steps quantized to multiples of 1024).  The
+# per-second sub-batch flush on the rate-limited path fixes the measurement.
+# Timing-tolerant: we only assert the value is no longer pinned near 0.
+rm -f "$TMP/sweepacc.json"
+$BIN --dry-run --sweep 500:1000:500:2 -M mac --report="$TMP/sweepacc.json" --seed 1 > /dev/null 2>&1
+ach=$(python3 -c "import json; print(json.load(open('$TMP/sweepacc.json'))['sweep']['steps'][0]['pps_achieved'])")
+if [[ $ach -ge 200 ]]; then
+    PASS=$((PASS+1)); echo "  $(green PASS) sweep step1 @500pps records $ach pps (was 0 pre-fix)"
+else
+    FAIL=$((FAIL+1)); echo "  $(red FAIL) sweep step1 pps_achieved=$ach (expected >=200; counter quantization regression)"
+fi
+
+# ------------------------------------------------------------------
+section "21. Frame minimum-size + unicast-dest invariants"
+# ------------------------------------------------------------------
+# ARP is 42 bytes on the wire; every builder now pads to the 60-byte Ethernet
+# minimum rather than relying on the driver to pad the runt.
+$BIN --pcap-out="$TMP/arp60.pcap" -n 1 -M arp --seed 7 > /dev/null
+arp_len=$(python3 -c "
+d=open('$TMP/arp60.pcap','rb').read(); print(int.from_bytes(d[24+8:24+12],'little'))")
+assert_eq "ARP frame padded to 60-byte Ethernet minimum" 60 "$arp_len"
+
+# The default MAC flood uses the fast path; its destination MAC must stay
+# unicast (multicast bit clear) just like build_packet_mac / the slow path.
+$BIN --pcap-out="$TMP/macuni.pcap" -n 1000 -M mac --seed 7 > /dev/null
+mc=$(python3 -c "
+d=open('$TMP/macuni.pcap','rb').read()
+i=24; mc=0
+while i+16<=len(d):
+    cl=int.from_bytes(d[i+8:i+12],'little'); i+=16
+    if d[i] & 1: mc+=1
+    i+=cl
+print(mc)")
+assert_eq "default MAC fast path emits 0 multicast dest MACs over 1000 frames" 0 "$mc"
+
+# With -U, multicast destinations are allowed again.
+$BIN --pcap-out="$TMP/macmc.pcap" -n 1000 -M mac -U --seed 7 > /dev/null
+mc_u=$(python3 -c "
+d=open('$TMP/macmc.pcap','rb').read()
+i=24; mc=0
+while i+16<=len(d):
+    cl=int.from_bytes(d[i+8:i+12],'little'); i+=16
+    if d[i] & 1: mc+=1
+    i+=cl
+print(mc)")
+if [[ $mc_u -gt 0 ]]; then
+    PASS=$((PASS+1)); echo "  $(green PASS) -U re-enables multicast dest MACs ($mc_u/1000 frames)"
+else
+    FAIL=$((FAIL+1)); echo "  $(red FAIL) -U produced no multicast dest MACs (expected ~half)"
+fi
 
 # ------------------------------------------------------------------
 echo

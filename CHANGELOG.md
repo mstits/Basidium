@@ -2,6 +2,44 @@
 
 All notable changes to Basidium are documented here.
 
+## [Unreleased]
+
+Follow-up bug-hunt patch after the 2.6 review. Six correctness/quality
+fixes; no new features. 144 regression assertions in `tests/run-all.sh`
+(up from 136); selftest, sanitizer suites, and `make check` clean.
+
+### Fixed
+- **`--diff` no longer invents phantom steps.** The step-array parser
+  walked to end-of-document instead of stopping at the array's closing
+  `]`, so the trailing `"nccl": {…}` and `"nic_stats": {…}` objects each
+  got parsed as an extra all-zero "step" — emitting bogus rows and
+  inflating the step count the CI regression gate reports. The walk is
+  now bounded to the matching `]`.
+- **`--report FILE` (space-separated form) lands in the named file.**
+  getopt only binds an optional argument via `--report=FILE`, so the
+  documented `--report sweep.json` form silently dropped the path and
+  auto-named a timestamped file. The next argv is now consumed when it
+  isn't another option. Stray positional arguments are rejected with a
+  clear error instead of being silently ignored.
+- **Achieved-PPS and live PPS no longer quantize to multiples of 1024.**
+  Unbounded runs only pushed `total_sent` in 1024-packet batches, so
+  sweep/TCO `pps_achieved` (and the live counter) snapped to 1024
+  multiples — and read 0 for any step that sent fewer than 1024 packets
+  in its window. The rate-limited path now flushes the sub-batch residual
+  once per wall-clock second; the unlimited path keeps the pure batched
+  counter (the 1024 grain is noise at Mpps).
+- **Default MAC fast path keeps the destination unicast.** It emitted a
+  multicast/broadcast destination MAC on ~half its frames, diverging from
+  `build_packet_mac`, the slow path, and what the selftest validates. It
+  now clears the multicast bit unless `-U` is set.
+- **ARP frames pad to the 60-byte Ethernet minimum** like every other
+  builder, instead of emitting a 42-byte runt and relying on the driver
+  to pad it.
+- **Minor:** `get_target_ip` top octet now spans the full unicast range
+  1..223 (was 1..222); the pcap-replay `usleep()` clamps below 1e6 (was
+  exactly 1e6 at `-r 1`, the POSIX `EINVAL` boundary); `-i` frees any
+  profile-loaded interface string before replacing it.
+
 ## [2.6] — 2026-05-08
 
 Bug-hunt patch release. No new user-facing features; eleven correctness
