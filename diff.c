@@ -120,7 +120,6 @@ static int find_string(char **cursor, const char *end, const char *key,
  * "steps": [ marker, then walk forward extracting one record per { ... }. */
 static int parse_steps(char *json, struct parsed *out) {
     char *p = json;
-    char *end = json + strlen(json);
 
     char *sweep = strstr(p, "\"sweep\"");
     char *scen  = strstr(p, "\"scenario\"");
@@ -149,13 +148,27 @@ static int parse_steps(char *json, struct parsed *out) {
     if (!arr) return -1;
     arr++;
 
+    /* Find the matching ']' that closes the steps array.  Without this bound
+     * the walk below ran to end-of-document and parsed the trailing
+     * "nccl": {...} and "nic_stats": {...} objects as phantom steps, emitting
+     * bogus all-zero rows and inflating the step count.  Step objects contain
+     * no nested arrays, but track '[' depth anyway so a future schema change
+     * doesn't reintroduce the bug. */
+    char *array_end = arr;
+    int depth = 1;
+    while (*array_end && depth > 0) {
+        if      (*array_end == '[') depth++;
+        else if (*array_end == ']') { depth--; if (depth == 0) break; }
+        array_end++;
+    }
+
     int count = 0;
     char *cursor = arr;
-    while (cursor < end && count < MAX_STEPS) {
+    while (cursor < array_end && count < MAX_STEPS) {
         char *brace = strchr(cursor, '{');
-        if (!brace) break;
+        if (!brace || brace >= array_end) break;
         char *close = strchr(brace, '}');
-        if (!close) break;
+        if (!close || close >= array_end) break;
 
         char *step_cursor = brace;
         struct step *st = &out->steps[count];
@@ -180,7 +193,6 @@ static int parse_steps(char *json, struct parsed *out) {
 
         count++;
         cursor = close + 1;
-        if (*cursor == ']' || (*cursor && strchr("]", *cursor))) break;
     }
     out->count = count;
     return 0;

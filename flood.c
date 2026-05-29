@@ -199,7 +199,7 @@ int is_learned_mac(uint8_t *mac) {
 uint32_t get_target_ip(struct rng_state *rng) {
     if (conf.target_count == 0) {
         uint32_t r = rng_rand(rng);
-        uint8_t  octet0 = 1 + (uint8_t)(r >> 24) % 222; /* 1..222, skips 0 + 224+ */
+        uint8_t  octet0 = 1 + (uint8_t)(r >> 24) % 223; /* 1..223, skips 0 and 224+ multicast */
         return htonl(((uint32_t)octet0 << 24) | (r & 0x00FFFFFFu));
     }
     struct target t = conf.targets[rng_rand(rng) % conf.target_count];
@@ -418,6 +418,10 @@ int build_packet_arp(uint8_t *buffer, struct rng_state *rng) {
     arp->tpa = get_target_ip(rng);
 
     int len = (int)(sizeof(struct ether_header_custom) + sizeof(struct arp_header));
+    /* Pad to the 60-byte Ethernet minimum like every other builder.  ARP is
+     * only 42 bytes on the wire; relying on the driver to pad runts is
+     * fragile across NICs, so emit a full-size frame ourselves. */
+    if (len < 60) { memset(buffer + len, 0, 60 - len); len = 60; }
     vlan_tag_frame(buffer, &len, rng);
     qinq_tag_frame(buffer, &len);
     return len;
@@ -728,6 +732,8 @@ void *worker_func(void *arg) {
 
     struct ether_header_custom *eth = (struct ether_header_custom *)buffer;
     uint64_t local_sent       = 0;
+    uint64_t flushed          = 0;  /* count already pushed to total_sent */
+    time_t   last_flush_sec   = 0;  /* wall-clock second of last sub-batch flush */
     int      inject_failures  = 0;
     /* fast path eligible: mode 0, no stealth/learning/targeting/VLAN-range.
      * Also disabled when a TCO scenario is active: mode switches require a
@@ -787,6 +793,12 @@ void *worker_func(void *arg) {
             mac6[0] = (uint8_t)r2;       mac6[1] = (uint8_t)(r2 >> 8);
             mac6[2] = (uint8_t)(r2 >> 16); mac6[3] = (uint8_t)(r2 >> 24);
             mac6[4] = (uint8_t)(r2 >> 32); mac6[5] = (uint8_t)(r2 >> 40);
+            /* Match the slow path / randomize_mac: keep the destination a
+             * unicast address unless multicast is explicitly allowed.  Without
+             * this the default MAC fast path emitted a multicast/broadcast dest
+             * on ~half its frames, diverging from build_packet_mac and from
+             * what the selftest validates. */
+            if (!conf.allow_multicast) mac6[0] &= 0xfe;
             memcpy(eth->dest, mac6, 6);
         }
         /* ---- Slow Path ---- */
@@ -858,6 +870,25 @@ void *worker_func(void *arg) {
             }
             struct timespec now, delta;
             clock_gettime(CLOCK_MONOTONIC, &now);
+
+            /* Keep total_sent current for the sweep/TCO measurement windows and
+             * the live PPS display.  In unbounded runs the counter is otherwise
+             * only pushed in 1024-packet batches, which quantizes achieved-pps
+             * to multiples of 1024 — and reads 0 below 1024 — at low rates.  We
+             * already pay for clock_gettime on this rate-limited path, so flush
+             * the sub-batch residual once per wall-clock second.  The unlimited
+             * path keeps the pure batched counter; at Mpps the 1024 grain is
+             * noise and flushing every second would add needless contention. */
+            if (conf.count == 0 && now.tv_sec != last_flush_sec) {
+                last_flush_sec = now.tv_sec;
+                uint64_t resid = local_sent - flushed;
+                if (resid) {
+                    atomic_fetch_add(&total_sent, resid);
+                    atomic_fetch_add(&thread_sent[thread_id], resid);
+                    flushed = local_sent;
+                }
+            }
+
             delta.tv_sec  = next_tx.tv_sec  - now.tv_sec;
             delta.tv_nsec = next_tx.tv_nsec - now.tv_nsec;
             if (delta.tv_nsec < 0) {
@@ -884,9 +915,10 @@ void *worker_func(void *arg) {
         if (conf.count > 0) {
             atomic_fetch_add(&total_sent, 1);
             atomic_fetch_add(&thread_sent[thread_id], 1);
-        } else if (local_sent > 0 && (local_sent & 1023) == 0) {
+        } else if (local_sent - flushed >= 1024) {
             atomic_fetch_add(&total_sent, 1024);
             atomic_fetch_add(&thread_sent[thread_id], 1024);
+            flushed += 1024;
         }
 
         /* Adaptive throttle check is independent of the count gate and stays
@@ -900,9 +932,10 @@ void *worker_func(void *arg) {
     }
 
     /* Residual flush only matters when we batched (count == 0); bounded
-     * runs already emitted per-packet. */
+     * runs already emitted per-packet.  Push whatever the 1024-batch and the
+     * per-second sub-batch flush left behind. */
     if (conf.count == 0) {
-        uint64_t residual = local_sent % 1024;
+        uint64_t residual = local_sent - flushed;
         atomic_fetch_add(&total_sent, residual);
         atomic_fetch_add(&thread_sent[thread_id], residual);
     }
@@ -949,8 +982,11 @@ void *pcap_replay_func(void *arg) {
             warned = 1;
         }
         int cur_pps = conf.pps;
-        if (cur_pps > 0)
-            usleep(1000000u / (unsigned)cur_pps);
+        if (cur_pps > 0) {
+            unsigned us = 1000000u / (unsigned)cur_pps;
+            if (us > 999999u) us = 999999u;  /* usleep() requires < 1e6 */
+            usleep(us);
+        }
     }
 
     pcap_close(inj);

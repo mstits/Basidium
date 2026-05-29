@@ -656,7 +656,7 @@ static void draw_help(void) {
     HL("  -v              Verbose per-thread startup and live PPS");
     HL("  -l <file>       JSON event log file");
     HL("  --report [file] Write JSON session report on exit");
-    HL("                  Default: basidium_report_<timestamp>.json");
+    HL("                  Default: basidium-<timestamp>.json");
     HBLK();
     HH("RATE SWEEP");
     HL("  --sweep start:end:step[:hold_s]");

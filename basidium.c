@@ -247,7 +247,7 @@ static void usage(void) {
     printf("  -l <file>       JSON event log file\n");
     printf("  --tui           Interactive ncurses TUI (iptraf-ng style)\n");
     printf("  --report [file] Write JSON session report on exit\n");
-    printf("                  Default filename: basidium_report_<timestamp>.json\n\n");
+    printf("                  Default filename: basidium-<timestamp>.json\n\n");
 
     printf("\033[1mRATE SWEEP:\033[0m\n");
     printf("  --sweep <start:end:step[:hold_s]>  Ramp rate from start to end pps\n");
@@ -434,7 +434,15 @@ int main(int argc, char **argv) {
                 conf.pfc_quanta = parse_int_range(optarg, 0, 0xFFFF, "pfc-quanta"); continue;
             }
             if (strcmp(name, "report")      == 0) {
-                conf.report_path = optarg ? strdup(optarg) : strdup("");
+                /* getopt only binds an optional argument via --report=FILE.
+                 * Accept the documented space form (--report FILE) by
+                 * consuming the next argv when it isn't another option, so the
+                 * README/man examples that write `--report sweep.json` land in
+                 * that file instead of silently auto-naming a timestamped one. */
+                const char *val = optarg;
+                if (!val && optind < argc && argv[optind][0] != '-')
+                    val = argv[optind++];
+                conf.report_path = (val && val[0]) ? strdup(val) : strdup("");
                 continue;
             }
             if (strcmp(name, "version")     == 0) { print_version = 1; continue; }
@@ -537,7 +545,7 @@ int main(int argc, char **argv) {
             continue;
         }
         switch (opt) {
-        case 'i': conf.interface        = strdup(optarg);  break;
+        case 'i': free(conf.interface); conf.interface = strdup(optarg);  break;
         case 'V':
             conf.vlan_id = parse_int_range(optarg, 0, 4094, "V (vlan)");
             break;
@@ -589,6 +597,14 @@ int main(int argc, char **argv) {
             usage_and_exit(2);
         }
     }
+
+    /* No subcommand takes positional arguments (--diff short-circuits before
+     * getopt), so anything left over is a typo — e.g. a second word after
+     * --report, or a misplaced value.  Fail loudly rather than silently
+     * ignoring it and running with a surprising config. */
+    if (optind < argc)
+        errx(1, "unexpected argument '%s' (no positional arguments accepted)",
+             argv[optind]);
 
     /* Apply --seed now that parsing is done.  When --seed is set we replace
      * the entropy-derived rng_base_seed and recompute probe_signature so the
