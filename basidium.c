@@ -1,5 +1,5 @@
 /*
- * basidium.c v2.4
+ * basidium.c v2.6.1
  * Basidium — Advanced Multi-Threaded Layer-2 Stress / Hardware Evaluation Utility
  *
  * SPDX-License-Identifier: MIT
@@ -39,7 +39,7 @@
 #include "diff.h"
 
 #ifndef BASIDIUM_VERSION
-#define BASIDIUM_VERSION "2.6"
+#define BASIDIUM_VERSION "2.6.1"
 #endif
 
 /*
@@ -67,6 +67,21 @@ static int parse_int_range(const char *s, int lo, int hi, const char *what) {
     return (int)parse_long_range(s, lo, hi, what);
 }
 
+/* Regression-threshold parser for --diff.  Sign-tolerant like
+ * --stop-on-degradation ("10" and "-10" both mean "flag a 10% drop"); 0
+ * explicitly disables that axis.  Malformed input aborts — the previous bare
+ * strtod() turned "abc" into 0.0, silently disabling regression detection. */
+static double parse_threshold(const char *s, const char *what) {
+    if (!s || !*s) errx(1, "%s: missing value", what);
+    char *end = NULL;
+    errno = 0;
+    double v = strtod(s, &end);
+    if (end == s || *end != '\0' || errno == ERANGE)
+        errx(1, "%s: '%s' is not a number", what, s);
+    if (v > 0) v = -v;
+    return v;
+}
+
 /* ---- Global state definitions (extern'd in flood.h) ---- */
 struct config     conf;
 atomic_ullong     total_sent      = 0;
@@ -88,6 +103,7 @@ atomic_ullong     thread_sent[MAX_THREADS];
 atomic_ullong     bcast_rx        = 0;
 uint16_t          probe_signature = 0;
 atomic_int        fail_open_detected = 0;
+atomic_int        degradation_detected = 0;
 uint8_t         (*learned_macs)[6] = NULL;
 int               learned_count   = 0;
 pcap_dumper_t    *global_pd       = NULL;
@@ -220,7 +236,7 @@ static void usage(void) {
     printf("  \033[32migmp\033[0m   IGMPv2 Membership Report flood (exhausts IGMP snooping table)\n\n");
 
     printf("\033[1mVLAN & PFC OPTIONS:\033[0m\n");
-    printf("  -V <id>              802.1Q VLAN tag (1-4094); applies to mac/arp/dhcp modes\n");
+    printf("  -V <id>              802.1Q VLAN tag (1-4094); applies to mac/arp/dhcp/igmp modes\n");
     printf("  --vlan-pcp <0-7>     802.1p priority bits in VLAN tag (default: 0)\n");
     printf("  --vlan-range <end>   Cycle VLAN IDs from -V <start> to <end> (random per frame)\n");
     printf("  --qinq <outer-vid>   802.1ad QinQ outer tag (combined with -V for true double-tag)\n");
@@ -238,7 +254,7 @@ static void usage(void) {
     printf("  -S <oui>     Stealth OUI prefix (e.g. 00:11:22)\n");
     printf("  -T <cidr>    Target IP subnet (e.g. 10.0.0.0/24)\n");
     printf("  -L           Learning mode — sniff real MACs, skip them\n");
-    printf("  -A           Adaptive mode — throttle on fail-open detection\n");
+    printf("  -A           Adaptive mode — throttle when broadcast RX rate spikes\n");
     printf("  -U           Allow multicast source MACs\n");
     printf("  -R           Randomize DHCP client MAC independently\n\n");
 
@@ -349,9 +365,9 @@ int main(int argc, char **argv) {
         double thr_busbw = -10.0;
         for (int i = 4; i < argc; i++) {
             if (strcmp(argv[i], "--diff-threshold-pps") == 0 && i + 1 < argc) {
-                thr_pps = strtod(argv[++i], NULL);
+                thr_pps = parse_threshold(argv[++i], "--diff-threshold-pps");
             } else if (strcmp(argv[i], "--diff-threshold-busbw") == 0 && i + 1 < argc) {
-                thr_busbw = strtod(argv[++i], NULL);
+                thr_busbw = parse_threshold(argv[++i], "--diff-threshold-busbw");
             } else {
                 errx(1, "--diff: unknown option '%s'", argv[i]);
             }
@@ -499,7 +515,7 @@ int main(int argc, char **argv) {
                 long val = strtol(optarg, &end, 10);
                 if (end == optarg || val < 0 || errno == ERANGE)
                     errx(1, "--duration: '%s' is not a valid duration", optarg);
-                if      (*end == '\0' || *end == 's') {}
+                if      (*end == '\0' || (*end == 's' && end[1] == '\0')) {}
                 else if (*end == 'm' && end[1] == '\0') val *= 60;
                 else if (*end == 'h' && end[1] == '\0') val *= 3600;
                 else if (*end == 'd' && end[1] == '\0') val *= 86400;
@@ -881,6 +897,13 @@ int main(int argc, char **argv) {
 
     /* Exit 2 if fail-open was detected (scriptable for SRE alerting) */
     if (conf.detect_failopen && fail_open_detected)
+        return 2;
+
+    /* Exit 2 if --stop-on-degradation tripped.  The sweep/TCO gates halt the
+     * run by clearing is_running, but that alone left the exit code at 0 —
+     * silently defeating the documented fail-fast contract that scripted
+     * gates check with `$? -eq 2`. */
+    if (degradation_detected)
         return 2;
 
     return 0;

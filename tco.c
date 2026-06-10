@@ -213,6 +213,7 @@ void *tco_thread_func(void *arg) {
                     if (delta <= conf.stop_on_degradation_pct) {
                         log_event("TCO_STOP",
                                   "stop-on-degradation threshold reached");
+                        atomic_store(&degradation_detected, 1);
                         atomic_store(&is_running, 0);
                     }
                 }

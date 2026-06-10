@@ -56,6 +56,25 @@ flood_mode_t mode_from_string(const char *str) {
 
 /* ---- Logging ---- */
 
+/* Emit a JSON string (with surrounding quotes), escaping the characters that
+ * would otherwise produce invalid JSON.  Event messages are program-generated
+ * today, but a control byte or quote in any of them silently corrupts the
+ * NDJSON event log for downstream consumers (jq/Loki) — escape defensively so
+ * every line stays parseable. */
+static void log_write_json_str(FILE *fp, const char *s) {
+    fputc('"', fp);
+    for (; *s; s++) {
+        if      (*s == '"')  fputs("\\\"", fp);
+        else if (*s == '\\') fputs("\\\\", fp);
+        else if (*s == '\n') fputs("\\n",  fp);
+        else if (*s == '\r') fputs("\\r",  fp);
+        else if (*s == '\t') fputs("\\t",  fp);
+        else if ((unsigned char)*s < 0x20) fprintf(fp, "\\u%04x", (unsigned char)*s);
+        else                 fputc(*s, fp);
+    }
+    fputc('"', fp);
+}
+
 void log_event(const char *type, const char *msg) {
     if (!conf.log_file)
         return;
@@ -65,8 +84,11 @@ void log_event(const char *type, const char *msg) {
         time_t now = time(NULL);
         char ts[64];
         strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", localtime(&now));
-        fprintf(fp, "{\"timestamp\": \"%s\", \"type\": \"%s\", \"message\": \"%s\"}\n",
-                ts, type, msg);
+        fprintf(fp, "{\"timestamp\": \"%s\", \"type\": ", ts);
+        log_write_json_str(fp, type);
+        fputs(", \"message\": ", fp);
+        log_write_json_str(fp, msg);
+        fputs("}\n", fp);
         fclose(fp);
     }
     pthread_mutex_unlock(&log_mutex);
@@ -592,6 +614,12 @@ int build_packet_igmp(uint8_t *buffer, struct rng_state *rng) {
     igmp->max_resp = 0;
     igmp->checksum = 0;
     igmp->group    = group_n;
+    /* RFC 2236 §2.3: the checksum is mandatory and receivers SHOULD drop
+     * messages that fail it — unlike IPv4 UDP there is no "checksum
+     * disabled" encoding.  An RFC-compliant IGMP snooper would discard
+     * every report we inject, turning the exhaustion mode into a no-op
+     * against exactly the compliant hardware being qualified. */
+    igmp->checksum = ip_checksum(igmp, sizeof(struct igmp_header));
 
     int len = (int)(sizeof(*eth) + sizeof(struct ip) + sizeof(struct igmp_header));
     if (len < 60) { memset(buffer + len, 0, 60 - len); len = 60; }
@@ -1094,6 +1122,7 @@ void *sweep_thread_func(void *arg) {
                     if (delta <= conf.stop_on_degradation_pct) {
                         log_event("SWEEP_STOP",
                                   "stop-on-degradation threshold reached");
+                        atomic_store(&degradation_detected, 1);
                         atomic_store(&is_running, 0);
                     }
                 }
@@ -1334,9 +1363,13 @@ int run_selftest(void) {
     uint8_t *igmp_bytes = buf + sizeof(*eth) + sizeof(struct ip);
     if (igmp_bytes[0] != 0x16)
         errx(1, "FAIL: IGMP type not 0x16 (Membership Report v2)");
+    /* RFC 2236 checksum must verify to zero over the 8-byte IGMP message —
+     * a zero/garbage checksum makes compliant snoopers drop the report. */
+    if (ip_checksum(igmp_bytes, sizeof(struct igmp_header)) != 0)
+        errx(1, "FAIL: IGMP checksum does not verify");
     if (igmp_len != 60)
         errx(1, "FAIL: IGMP frame length %d (expected 60)", igmp_len);
-    printf("[PASS] IGMP Builder\n");
+    printf("[PASS] IGMP Builder (with checksum)\n");
 
     /* Test 11: payload pattern */
     memset(buf, 0, MAX_PACKET_SIZE);

@@ -221,6 +221,7 @@ extern atomic_int        is_started;     /* TUI: set to 1 when user presses star
 extern atomic_ullong     peak_pps;       /* highest PPS observed this session */
 extern uint16_t          probe_signature; /* embedded in MAC-flood IP ID for fail-open detection */
 extern atomic_int        fail_open_detected;
+extern atomic_int        degradation_detected; /* --stop-on-degradation tripped (exit 2) */
 /* sweep state — updated by sweep_thread_func, read by TUI */
 extern atomic_int        sweep_step_num;
 extern atomic_int        sweep_total_steps;

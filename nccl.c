@@ -4,8 +4,9 @@
  * SPDX-License-Identifier: MIT
  * Copyright (c) 2026 Matthew Stits
  *
- * Runs nccl-tests binaries (e.g. all_reduce_perf) as a subprocess via popen(),
- * parses their tabular output, and stores results for TUI correlation display.
+ * Runs nccl-tests binaries (e.g. all_reduce_perf) as a subprocess via
+ * pipe+fork+execvp (no shell), parses their tabular output, and stores results
+ * for TUI correlation display.
  *
  * Expected output format (nccl-tests standard):
  *   #       size  count  type  redop    time  algbw  busbw  ...
@@ -14,6 +15,7 @@
 #define _GNU_SOURCE
 #include "nccl.h"
 
+#include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -55,6 +57,15 @@ int nccl_parse_line(const char *line, struct nccl_result *out) {
     int n = sscanf(line, " %zu %llu %15s %15s %lf %lf %lf",
                    &msg_size, &count, type, redop, &time_us, &alg_bw, &bus_bw);
     if (n < 7)
+        return 0;
+
+    /* Reject non-finite bandwidths.  nccl-tests can print "inf"/"nan" in the
+     * busbw column on a degenerate run, and strtod/sscanf parse those happily.
+     * A non-finite value would then propagate into the JSON/CSV reports as a
+     * bare `inf`/`nan` token — invalid JSON that breaks --diff and every
+     * downstream consumer.  Drop the row at the source so no later stage has
+     * to defend against it. */
+    if (!isfinite(time_us) || !isfinite(alg_bw) || !isfinite(bus_bw))
         return 0;
 
     out->msg_size = msg_size;

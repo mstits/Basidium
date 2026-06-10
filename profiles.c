@@ -73,11 +73,13 @@ static int profile_name_safe(const char *name) {
 /*
  * Resolve the profile directory.  Order:
  *   1. $BASIDIUM_PROFILE_DIR (explicit override)
- *   2. $XDG_CONFIG_HOME/basidium  (XDG basedir spec)
- *   3. $HOME/.basidium            (legacy, kept for compat)
- *   4. /tmp/.basidium             (last-ditch when no HOME)
+ *   2. $HOME/.basidium       (legacy, kept for compat) when it already exists
+ *   3. $XDG_CONFIG_HOME/basidium  (XDG basedir spec), else $HOME/.basidium
  * If the legacy ~/.basidium exists and the XDG path does not, we keep using
  * the legacy path so existing profiles continue to load without migration.
+ * When HOME is unset and getpwuid() fails we refuse rather than fall back to
+ * /tmp (a symlink-following hazard when running as root) — callers see an
+ * empty string and bail out with a diagnostic.
  */
 void profiles_dir(char *out, size_t len) {
     const char *override_dir = getenv("BASIDIUM_PROFILE_DIR");
@@ -153,6 +155,13 @@ static int profile_validate(const struct config *c, const char *name) {
         err = "payload_pattern must be 0..3";
     else if (c->session_duration < 0)
         err = "session_duration must be >= 0";
+    /* Mirror the CLI's --sweep validation.  A profile carrying just
+     * sweep_enabled=1 bypasses that check and reaches sweep_thread_func with
+     * sweep_step=0, where the step-count division is a SIGFPE. */
+    else if (c->sweep_enabled &&
+             (c->sweep_start <= 0 || c->sweep_end <= c->sweep_start ||
+              c->sweep_step <= 0))
+        err = "sweep_enabled requires 0 < sweep_start < sweep_end and sweep_step > 0";
 
     if (err) {
         fprintf(stderr, "profile '%s': %s\n", name, err);

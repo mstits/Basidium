@@ -75,7 +75,7 @@ int write_report(const char *path, const struct nic_stats *final_nic) {
 
     fprintf(fp, "  \"pps_target\": %d,\n", conf.pps);
     fprintf(fp, "  \"packet_size\": %d,\n",
-            conf.packet_size > 0 ? conf.packet_size : 64);
+            conf.packet_size > 0 ? conf.packet_size : 60);
 
     /* timing */
     fprintf(fp, "  \"duration_s\": %ld,\n", (long)elapsed);
