@@ -2,13 +2,56 @@
 
 All notable changes to Basidium are documented here.
 
-## [Unreleased]
+## [2.6.1] — 2026-06-10
 
-Follow-up bug-hunt patch after the 2.6 review. Six correctness/quality
-fixes; no new features. 144 regression assertions in `tests/run-all.sh`
-(up from 136); selftest, sanitizer suites, and `make check` clean.
+Follow-up bug-hunt patch after the 2.6 review. Correctness and
+fail-fast-contract fixes; no new features. 163 regression assertions in
+`tests/run-all.sh` (up from 136); selftest, three sanitizer suites
+(ASan, UBSan, TSan), and `make check` clean.
 
 ### Fixed
+- **`--stop-on-degradation` now exits 2 as documented.** The sweep
+  (`sweep_thread_func`) and TCO (`tco_thread_func`) gates halted the run
+  on an NCCL busbw regression by clearing `is_running`, but nothing set
+  an exit-code flag, so `main()` returned 0 — silently defeating the
+  documented fail-fast contract that scripted gates check with
+  `$? -eq 2`. A dedicated `_Atomic degradation_detected` flag now drives
+  the exit code. Regression-tested end-to-end with a stub nccl-tests
+  binary (sweep and scenario variants plus a no-degradation control),
+  which also gives the `fork`+`execvp` NCCL subprocess path its first
+  automated coverage. TSan-clean.
+- **`--diff` thresholds are sign-tolerant and validated.** A positive or
+  zero `--diff-threshold-pps` / `--diff-threshold-busbw` silently
+  disabled that regression axis — a CI false-pass — because the gate only
+  fires on a negative threshold. The values are now normalized like
+  `--stop-on-degradation` (`30` and `-30` both mean "flag a 30% drop"),
+  and a non-numeric threshold errors out instead of `strtod`-ing to 0.0.
+- **IGMP membership reports carry a valid RFC 2236 checksum.** Unlike
+  IPv4 UDP there is no "checksum disabled" encoding; a compliant IGMP
+  snooper drops reports that fail the checksum, so the zero-checksum
+  frames made `-M igmp` a no-op against exactly the hardware being
+  qualified. `build_packet_igmp` now computes it via `ip_checksum`;
+  selftest asserts the message checksum verifies to zero.
+- **A profile that enables a sweep without a valid step is rejected.**
+  `sweep_enabled=1` with a zero/absent `sweep_step` passed
+  `profile_validate` (which never checked sweep consistency), bypassed
+  the CLI's `--sweep` validation, and reached `sweep_thread_func` where
+  the step-count division is a divide-by-zero (SIGFPE). The loader now
+  enforces `0 < sweep_start < sweep_end` and `sweep_step > 0`.
+- **Non-finite NCCL busbw no longer corrupts the report.** `nccl-tests`
+  can print `inf`/`nan` in the busbw column on a degenerate run;
+  `sscanf`/`strtod` parse those happily and the value reached the JSON
+  and CSV as a bare `inf`/`nan` token — invalid JSON that breaks `--diff`
+  and every downstream consumer. `nccl_parse_line` now rejects rows with
+  a non-finite `time`/`algbw`/`busbw` at the source.
+- **`-l` JSON event log is properly escaped.** v2.5 claimed the event
+  log escapes control bytes; `log_event` actually emitted raw `%s`, so a
+  control byte or quote in any field would break the NDJSON. Both the
+  `type` and `message` fields now run through the same escaper
+  `write_report` uses. Tested: every emitted line parses as JSON.
+- **Minor:** `--duration 30sX` (trailing junk after the `s` suffix) is
+  now rejected like the other suffixes; the JSON report's default
+  `packet_size` reads 60 (the real minimum frame size) instead of 64.
 - **`--diff` no longer invents phantom steps.** The step-array parser
   walked to end-of-document instead of stopping at the array's closing
   `]`, so the trailing `"nccl": {…}` and `"nic_stats": {…}` objects each

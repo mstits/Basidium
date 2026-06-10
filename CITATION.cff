@@ -2,8 +2,8 @@ cff-version: 1.2.0
 message: "If you use Basidium in academic or industrial fabric-qualification work, please cite it as below."
 title: "Basidium: Multi-threaded Layer-2 Stress and Hardware Evaluation Tool for GPU Cluster Fabrics"
 type: software
-version: "2.6"
-date-released: 2026-05-08
+version: "2.6.1"
+date-released: 2026-06-10
 abstract: >-
   Basidium is a libpcap-based Layer-2 packet injection utility for stress-testing
   and qualifying lossless Ethernet fabrics that carry RoCE / RDMA traffic in GPU

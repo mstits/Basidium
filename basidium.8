@@ -1,4 +1,4 @@
-.TH BASIDIUM 8 "2026-05-08" "Basidium v2.6" "System Administration"
+.TH BASIDIUM 8 "2026-06-10" "Basidium v2.6.1" "System Administration"
 .SH NAME
 basidium \- multi-threaded Layer-2 stress and hardware evaluation tool
 .SH SYNOPSIS
@@ -65,6 +65,11 @@ Rate limit in packets per second. 0 = unlimited.
 .TP
 .BI \-J " bytes"
 Ethernet frame size in bytes (60\(en9216, supports jumbo frames).
+Only the
+.B mac
+flood honors this; the other modes emit their protocol's fixed-size frame.
+The frame is reduced by 4 bytes per VLAN/QinQ tag so the requested size is
+never exceeded.
 .TP
 .BI \-n " count"
 Stop after injecting
@@ -73,7 +78,18 @@ frames.
 .SS "VLAN & PFC Options"
 .TP
 .BI \-V " vlan-id"
-Tag frames with 802.1Q VLAN ID (1\(en4094).
+Tag frames with 802.1Q VLAN ID (1\(en4094). Applied to the
+.BR mac ,
+.BR arp ,
+.BR dhcp ,
+and
+.B igmp
+builders; the L2 control-protocol modes
+.RB ( pfc ,
+.BR lldp ,
+.BR stp ,
+.BR nd )
+are emitted untagged.
 .TP
 .BI \-\-vlan-pcp " 0-7"
 802.1p Priority Code Point bits in the VLAN tag (default: 0).
@@ -107,7 +123,7 @@ Target IP subnet for embedded IP headers. Repeatable (up to 64).
 Learning mode: sniff and skip observed MAC addresses.
 .TP
 .B \-A
-Adaptive mode: throttle on broadcast storm detection.
+Adaptive mode: throttle injection when the sniffed broadcast RX rate spikes.
 .TP
 .B \-U
 Allow multicast source MACs.
@@ -203,6 +219,11 @@ measures busbw at each scenario step marked with
 .BI \-\-nccl-binary " path"
 Path to nccl-tests binary (implies
 .BR \-\-nccl ).
+Default:
+.IR /usr/local/bin/all_reduce_perf .
+Launched via
+.IR fork (2)/ execvp (3)
+with no shell, so the path and its arguments are never shell-evaluated.
 .SS "Profiles & Sessions"
 .TP
 .BI \-\-profile " name"
@@ -211,11 +232,16 @@ Load profile from
 .TP
 .BI \-\-duration " time"
 Auto-stop: seconds, e.g.
-.BR 30 ;
+.BR 30
+(or
+.BR 30s );
 minutes, e.g.
 .BR 5m ;
 hours, e.g.
-.BR 2h .
+.BR 2h ;
+days, e.g.
+.BR 1d .
+An unknown suffix is rejected.
 .SS "Diagnostics"
 .TP
 .B \-\-selftest
@@ -223,7 +249,13 @@ Run 14 built-in validation tests (packet builders, TCO scenario parser,
 NCCL output parser) and exit.
 .TP
 .B \-\-version
-Print version and exit.
+Print version and exit. Add
+.B \-\-json
+.RB ( "\-\-version \-\-json" )
+for machine-parsable output.
+.TP
+.B \-h\fR, \fB\-\-help
+Print the full usage summary and exit 0.
 .TP
 .B \-\-dry\-run
 Build and count packets without injecting. Does not require root
@@ -344,13 +376,12 @@ Compare today's report to yesterday's:
 .SH FILES
 .TP
 .I ~/.basidium/*.conf
-Named configuration profiles. Honors
-.I $XDG_CONFIG_HOME
-and
+Named configuration profiles. The directory is resolved in order:
 .I $BASIDIUM_PROFILE_DIR
-when the legacy
+(explicit override, always honored first); then the legacy
 .I ~/.basidium/
-directory does not exist.
+when it already exists; otherwise
+.IR $XDG_CONFIG_HOME/basidium .
 .TP
 .I *.tco
 TCO scenario files. Plain-text, one step per line:

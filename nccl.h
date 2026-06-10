@@ -9,8 +9,9 @@
  * with active flood/stress operations.
  *
  * NOTE: NCCL-tests require Linux + NVIDIA GPUs with CUDA. On macOS/BSD
- * the --nccl flag is accepted and the module compiles, but nccl_start()
- * will fail gracefully if the binary is not found (popen returns NULL).
+ * the --nccl flag is accepted and the module compiles, but nccl_launch()
+ * fails gracefully if the binary is not found (execvp in the child exits
+ * 127 and the parent reports NCCL_ERROR).
  */
 #ifndef NCCL_MODULE_H
 #define NCCL_MODULE_H

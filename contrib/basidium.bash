@@ -51,7 +51,20 @@ _basidium() {
             return 0
             ;;
         --profile)
-            local pdir="${BASIDIUM_PROFILE_DIR:-$HOME/.basidium}"
+            # Mirror profiles_dir() resolution order: explicit override, then
+            # legacy ~/.basidium when present, else the XDG config dir.
+            local pdir
+            if [[ -n "${BASIDIUM_PROFILE_DIR:-}" ]]; then
+                pdir="$BASIDIUM_PROFILE_DIR"
+            elif [[ -d "$HOME/.basidium" ]]; then
+                pdir="$HOME/.basidium"
+            elif [[ -n "${XDG_CONFIG_HOME:-}" ]]; then
+                pdir="$XDG_CONFIG_HOME/basidium"
+            else
+                # Matches profiles_dir(): with no XDG_CONFIG_HOME the C code
+                # falls back to the legacy ~/.basidium, not ~/.config.
+                pdir="$HOME/.basidium"
+            fi
             local names
             names=$(ls "$pdir"/*.conf 2>/dev/null \
                     | xargs -n1 basename 2>/dev/null \
@@ -59,12 +72,12 @@ _basidium() {
             COMPREPLY=( $(compgen -W "$names" -- "$cur") )
             return 0
             ;;
-        --scenario|--validate|--pcap-replay)
+        --scenario|--validate)
             COMPREPLY=( $(compgen -f -X '!*.tco' -- "$cur") \
                        $(compgen -d -- "$cur") )
             return 0
             ;;
-        --pcap-out)
+        --pcap-out|--pcap-replay)
             COMPREPLY=( $(compgen -f -X '!*.pcap' -- "$cur") \
                        $(compgen -d -- "$cur") )
             return 0

@@ -1,4 +1,4 @@
-# Basidium (V2.6)
+# Basidium (V2.6.1)
 
 **Multi-threaded Layer-2 Stress & Hardware Evaluation Tool for GPU Cluster Fabrics**
 
@@ -40,12 +40,44 @@ In a GPU cluster, **the network fabric is the basidium**. The models get the hea
 
 **What it isn't:**
 
-- **Not a single-host line-rate generator for 400/800 GbE spines.** libpcap caps around 3–5 Mpps/core. Saturating a real GPU spine takes multiple coordinated injectors or an AF_XDP / DPDK backend. Multi-host coordination and a faster TX backend are tracked for v2.6+.
+- **Not a single-host line-rate generator for 400/800 GbE spines.** libpcap caps around 3–5 Mpps/core. Saturating a real GPU spine takes multiple coordinated injectors or an AF_XDP / DPDK backend. Multi-host coordination and a faster TX backend are tracked for v2.7.
 - **Not a substitute for a real training workload.** `nccl-tests` allreduce is a proxy. Overlapped gradient sync in real Megatron / NeMo steps has different congestion dynamics that allreduce alone does not capture.
 - **Not a realistic PFC backpressure simulator.** PFC PAUSE flooding is brute-force frame injection — it verifies *"does the switch's PFC watchdog fire correctly under malformed input"*, not realistic buffer-pressure feedback loops driven by actual queue occupancy.
 - **Not for production fabrics.** See the Total Cluster Outage warning below.
 
 **Where it earns its keep:** airgapped lab qualification, firmware / topology regression gates (`--seed` + `--diff` + exit 2), PFC watchdog verification, fail-open detection during bring-up, and CI-style fabric checks for teams that don't have or don't want commercial test gear.
+
+### What's new in v2.6.1
+
+Follow-up bug-hunt patch — correctness and contract fixes, no new
+user-facing features. Three sanitizers (ASan, UBSan, TSan) clean on
+selftest and scenario dry-run; 163 regression assertions.
+
+- **`--stop-on-degradation` now exits 2 as documented.** The sweep and
+  TCO gates halted the run on an NCCL busbw regression but left the exit
+  code at 0, so scripted fail-fast gates checking `$? -eq 2` never fired.
+  A dedicated `degradation_detected` flag now drives the exit code, and a
+  stub-NCCL regression test pins the contract (it also gives the
+  fork+execvp subprocess path its first automated coverage).
+- **`--diff` thresholds are sign-tolerant and validated.** A positive or
+  zero `--diff-threshold-*` silently disabled that regression axis (a CI
+  false-pass); `30` and `-30` now both mean "flag a 30% drop", and a
+  non-numeric threshold errors instead of `strtod`-ing to 0.
+- **IGMP membership reports carry a valid RFC 2236 checksum.** A
+  zero/garbage checksum makes compliant snoopers drop every injected
+  report, turning `-M igmp` into a no-op against exactly the hardware
+  being qualified.
+- **A profile that enables a sweep without a valid step is rejected.**
+  It previously bypassed the CLI's `--sweep` validation and reached the
+  sweep thread with `sweep_step=0`, a divide-by-zero (SIGFPE).
+- **Non-finite NCCL busbw no longer corrupts the report.** `inf`/`nan`
+  in the busbw column is dropped at the parser, so the JSON/CSV stay
+  valid (and `--diff` keeps working).
+- **The `-l` JSON event log is now properly escaped** — control bytes
+  and quotes in any event field produce valid JSON, matching the v2.5
+  claim. Minor: `--duration 30sX` (trailing junk after `s`) is rejected,
+  and the report's default `packet_size` reads 60 (the real minimum
+  frame), not 64.
 
 ### What's new in v2.6
 
@@ -105,7 +137,7 @@ See [`CHANGELOG.md`](CHANGELOG.md) for the full list with code locations.
   `-T 10.0.0.0/40`, `-S 00:11`, `--duration 5x` now error out instead of
   corrupting state), `sigaction` + SIGPIPE-ignore, OS-entropy RNG seeding,
   proper `clock_gettime`-based per-packet rate limiter.
-- **`make test`** — exhaustive offline test runner (136 assertions in v2.6);
+- **`make test`** — exhaustive offline test runner (163 assertions);
   `make asan` / `make tsan` for sanitizer rebuilds; `make check` validates
   every shipped scenario; the man page lints clean with `mandoc -Tlint`.
 - **Bash completion** in `contrib/basidium.bash`.
@@ -345,7 +377,7 @@ sudo make install PREFIX=/opt/local
 # 14-test self-test suite (packet builders + TCO/NCCL parsers)
 sudo make selftest
 
-# Exhaustive offline test suite (136 assertions: every flag, error path,
+# Exhaustive offline test suite (163 assertions: every flag, error path,
 # packet-builder content via pcap-out, RNG determinism, profile loader,
 # diff regression detection, NDJSON/CSV/compact reports, signal handling,
 # UBSan-clean alignment, sanitizer build, ND wire format).  Does not
@@ -424,7 +456,7 @@ sudo ./basidium -i eth0 --scenario examples/pfc-recovery.tco --nccl \
 | `-i <iface>` | required | Network interface |
 | `-t <n>` | 1 | Worker threads (max 16) |
 | `-r <pps>` | 0 (unlimited) | Rate limit packets/sec |
-| `-J <bytes>` | 60 | Frame size (60-9216) |
+| `-J <bytes>` | 60 | Frame size (60-9216); honored by `mac` mode only — other modes emit a fixed-size frame |
 | `-n <count>` | 0 (unlimited) | Stop after N frames |
 
 ### VLAN & PFC
@@ -443,7 +475,7 @@ sudo ./basidium -i eth0 --scenario examples/pfc-recovery.tco --nccl \
 | `-S <OUI>` | Restrict source MAC OUI (e.g. `00:11:22`) |
 | `-T <CIDR>` | Embed IPs from subnet; repeatable up to 64 |
 | `-L` | Learning mode — skip observed MACs |
-| `-A` | Adaptive mode — throttle on broadcast storm |
+| `-A` | Adaptive mode — throttle when the sniffed broadcast RX rate spikes |
 | `-U` | Allow multicast source MACs |
 | `-R` | Randomize DHCP client MAC independently |
 
@@ -474,7 +506,7 @@ Ramps injection rate from `start` to `end` PPS in `step` increments, holding eac
 | Flag | Description |
 |------|-------------|
 | `--nccl` | NCCL busbw correlation panel in TUI; per-step measurement during `--sweep` and `--scenario` |
-| `--nccl-binary <path>` | Path to nccl-tests binary (implies `--nccl`) |
+| `--nccl-binary <path>` | Path to nccl-tests binary (implies `--nccl`); default `/usr/local/bin/all_reduce_perf`. Launched via `fork`+`execvp` with no shell |
 
 ### TCO (Targeted Congestion Orchestration)
 | Flag | Description |
@@ -537,7 +569,7 @@ Launch with `--tui` (requires `make TUI=1`). Starts in **STANDBY** — no inject
 | `-` | Rate -1000 pps |
 | `o` | Set OUI prefix |
 | `v` | Set VLAN ID |
-| `n` | Toggle NCCL panel |
+| `n` | Launch NCCL test (requires `--nccl`) |
 | `b` | Record NCCL baseline |
 | `l` | Load `.pcap` for replay |
 
@@ -655,12 +687,15 @@ print(f"STP topo changes:    {stp}")
 print(f"Interface errors:    {errs}")
 print()
 
-if report.get("sweep"):
+sweep = report.get("sweep")
+if sweep:
     print("Sweep results:")
-    for s in report["sweep"]:
-        eff = s['achieved_pps'] / s['target_pps'] * 100
-        print(f"  step {s['step']:>2}: {s['target_pps']:>8} pps target  "
-              f"→  {s['achieved_pps']:>8} achieved  ({eff:.1f}%)")
+    for i, s in enumerate(sweep["steps"], 1):
+        target = s["pps_target"]
+        achieved = s["pps_achieved"]
+        eff = achieved / target * 100 if target else 0.0
+        print(f"  step {i:>2}: {target:>8} pps target  "
+              f"→  {achieved:>8} achieved  ({eff:.1f}%)")
 ```
 
 ### Watch STP TCN events during STP flood
@@ -1003,7 +1038,7 @@ diff.c/.h           --diff regression detection: parse two reports, compare
 contrib/
     basidium.bash   bash completion (modes, flags, scenario files, profiles)
 examples/*.tco      shipped scenarios (validated by `make check` via --validate)
-tests/run-all.sh    exhaustive offline test suite (136 assertions)
+tests/run-all.sh    exhaustive offline test suite (163 assertions)
 basidium.8          man page (lints clean with `mandoc -Tlint`)
 ```
 

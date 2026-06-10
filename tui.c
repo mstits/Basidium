@@ -648,7 +648,7 @@ static void draw_help(void) {
     HL("  -S <oui>     Stealth OUI prefix (e.g. 00:11:22)");
     HL("  -T <cidr>    Target IP subnet (e.g. 10.0.0.0/24)");
     HL("  -L           Learning mode — sniff real MACs, skip them");
-    HL("  -A           Adaptive mode — throttle on fail-open");
+    HL("  -A           Adaptive mode — throttle when bcast RX spikes");
     HL("  -U           Allow multicast source MACs");
     HL("  -R           Randomize DHCP client MAC independently");
     HBLK();
@@ -684,8 +684,29 @@ static void draw_help(void) {
     HL("  --detect               Fail-open detection and alerting");
     HL("  --payload pattern      zeros ff dead incr (default: zeros)");
     HBLK();
+    HH("MACHINE-READABLE OUTPUT");
+    HL("  --ndjson           One JSON status object per second on stdout");
+    HL("  --csv <file>       Emit sweep/scenario steps as CSV");
+    HL("  --report-compact   Single-line JSON report");
+    HBLK();
+    HH("STOP CONDITIONS (FAIL-FAST GATES)");
+    HL("  --stop-on-failopen        Halt on first fail-open (exit 2)");
+    HL("  --stop-on-degradation N   Halt when NCCL busbw drops -N% (exit 2)");
+    HBLK();
+    HH("REGRESSION DETECTION");
+    HL("  --diff a.json b.json      Compare two reports (exit 2 on breach)");
+    HL("  --diff-threshold-pps N    pps regression threshold (default -10)");
+    HL("  --diff-threshold-busbw N  busbw regression threshold (default -10)");
+    HL("  --seed N                  Deterministic RNG + probe signature");
+    HBLK();
     HH("DIAGNOSTICS");
-    HL("  --selftest   Run built-in validation suite (builders + parsers, 14 tests)");
+    HL("  --selftest      Run built-in validation suite (builders + parsers)");
+    HL("  --validate <f>  Validate a .tco scenario file and exit");
+    HL("  --print-config  Print effective merged config and exit");
+    HL("  --list-modes    Print supported flood modes and exit");
+    HL("  --list-profiles Print saved profile names and exit");
+    HL("  --version       Print version (--version --json for JSON)");
+    HL("  --dry-run       Build & count packets without injecting");
 
 #undef HL
 #undef HH
@@ -1109,7 +1130,7 @@ void tui_draw(void) {
     else
         mvwprintw(w_config, cfg_row++, 2, "OUI:     random");
     mvwprintw(w_config, cfg_row++, 2, "PktSize: %d bytes",
-              conf.packet_size ? conf.packet_size : 64);
+              conf.packet_size ? conf.packet_size : 60);
     mvwprintw(w_config, cfg_row++, 2, "Learn: %-3s  Adapt: %-3s",
               conf.learning ? "on" : "off",
               conf.adaptive ? "on" : "off");

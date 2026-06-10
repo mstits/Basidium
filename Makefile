@@ -9,7 +9,7 @@ CFLAGS  = -Wall -Wextra -Wformat=2 -Wshadow -Wnull-dereference \
           -fno-strict-aliasing -O2 -D_FORTIFY_SOURCE=2
 LDFLAGS = -lpcap -pthread
 
-VERSION = 2.6
+VERSION = 2.6.1
 CFLAGS += -DBASIDIUM_VERSION=\"$(VERSION)\"
 
 TARGET  = basidium
@@ -40,10 +40,11 @@ check: $(TARGET)
 	@for f in examples/*.tco; do ./$(TARGET) --validate "$$f" || exit 1; done
 	@echo "All checks passed."
 
-# Exhaustive offline test suite (~120 assertions covering every flag, every
+# Exhaustive offline test suite (163 assertions covering every flag, every
 # error path, packet builders via pcap-out, RNG determinism, profile loader,
-# diff regression detection, signal handling, sanitizer build).  Requires
-# python3 for pcap parsing.  Does not need sudo or a NIC.
+# diff regression detection, the NCCL subprocess + --stop-on-degradation exit
+# path via a stub binary, signal handling, sanitizer build).  Requires python3
+# for pcap parsing.  Does not need sudo or a NIC.
 test: $(TARGET)
 	bash tests/run-all.sh
 

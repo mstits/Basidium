@@ -85,7 +85,7 @@ section "2. Help / version / list flags"
 # ------------------------------------------------------------------
 assert_exit "--version exit 0"        0 $BIN --version
 out=$($BIN --version --json)
-assert_eq "--version --json content"  '{"version": "2.6"}' "$out"
+assert_eq "--version --json content"  '{"version": "2.6.1"}' "$out"
 assert_exit "--help exit 0"           0 $BIN --help
 assert_exit "-h exit 0"               0 $BIN -h
 out=$($BIN --list-modes | tr '\n' ' ')
@@ -116,6 +116,7 @@ assert_exit "--qinq 0 (<1)"                     1 $BIN --qinq 0
 assert_exit "--qinq 5000 (>4094)"               1 $BIN --qinq 5000
 assert_exit "--vlan-range 0 (<1)"               1 $BIN --vlan-range 0
 assert_exit "--duration 5x (bad suffix)"        1 $BIN --duration 5x
+assert_exit "--duration 30sX (junk after s)"    1 $BIN --duration 30sX
 assert_exit "--duration -5 (negative)"          1 $BIN --duration -5
 assert_exit "--duration abc (non-numeric)"      1 $BIN --duration abc
 assert_exit "--payload neon (unknown pattern)"  1 $BIN --payload neon
@@ -144,6 +145,7 @@ assert_exit "--pfc-quanta 65535"     0 $BIN --pfc-quanta 65535 --print-config
 assert_exit "-T 10.0.0.0/0 (zero mask)"  0 $BIN -T 10.0.0.0/0  --print-config
 assert_exit "-T 10.0.0.0/32 (host)"      0 $BIN -T 10.0.0.0/32 --print-config
 assert_exit "--duration 30 (bare int)"   0 $BIN --duration 30 --print-config
+assert_exit "--duration 30s (explicit s)" 0 $BIN --duration 30s --print-config
 assert_exit "--duration 5m"              0 $BIN --duration 5m --print-config
 assert_exit "--duration 2h"              0 $BIN --duration 2h --print-config
 assert_exit "--duration 1d"              0 $BIN --duration 1d --print-config
@@ -409,6 +411,9 @@ fi
 # Scenario step entries should equal planned (ci-smoke = 2 steps)
 sc_steps=$(python3 -c "import json; print(len(json.load(open('$TMP/r.json'))['scenario']['steps']))")
 assert_eq "scenario steps count == planned (2)" 2 "$sc_steps"
+# Default packet_size in the report reflects the real minimum frame (60), not 64.
+pkt=$(python3 -c "import json; print(json.load(open('$TMP/r.json'))['packet_size'])")
+assert_eq "report default packet_size == 60 (real min frame)" 60 "$pkt"
 
 # ------------------------------------------------------------------
 section "13. NDJSON output"
@@ -717,6 +722,154 @@ if [[ $mc_u -gt 0 ]]; then
     PASS=$((PASS+1)); echo "  $(green PASS) -U re-enables multicast dest MACs ($mc_u/1000 frames)"
 else
     FAIL=$((FAIL+1)); echo "  $(red FAIL) -U produced no multicast dest MACs (expected ~half)"
+fi
+
+# ------------------------------------------------------------------
+section "22. IGMP membership-report checksum (RFC 2236)"
+# ------------------------------------------------------------------
+# build_packet_igmp must compute a valid IGMP checksum.  A zero/garbage
+# checksum makes RFC-compliant snoopers drop the report, turning the
+# exhaustion mode into a no-op against exactly the hardware being qualified.
+$BIN --pcap-out="$TMP/igmp.pcap" -n 1 -M igmp --seed 7 > /dev/null
+igmp_ck=$(python3 -c "
+with open('$TMP/igmp.pcap','rb') as f: d=f.read()
+base = 24 + 16 + 14           # pcap hdr + record hdr + ethernet
+igmp = d[base+20:base+28]     # 8-byte IGMP message after 20-byte IP header
+s = 0
+for i in range(0, 8, 2):
+    s += int.from_bytes(igmp[i:i+2], 'big')
+while s >> 16: s = (s & 0xffff) + (s >> 16)
+print('ok' if (~s & 0xffff) == 0 else f'BAD ones-complement={(~s & 0xffff):#06x}')")
+assert_eq "IGMP checksum verifies to zero" "ok" "$igmp_ck"
+
+# ------------------------------------------------------------------
+section "23. --stop-on-degradation exit 2 (NCCL subprocess path)"
+# ------------------------------------------------------------------
+# The documented fail-fast contract: when NCCL busbw drops past the threshold,
+# the run halts AND exits 2 so scripted gates ([ $? -eq 2 ]) fire.  Pre-fix the
+# gate cleared is_running but left the exit code at 0, silently defeating it.
+# Exercised fully offline with a stub nccl-tests binary (also the only coverage
+# of the fork+execvp subprocess path).
+STUB_CNT="$TMP/nccl-calls"
+echo 0 > "$STUB_CNT"
+# Decreasing-busbw stub: 100 GB/s on the first call, 10 GB/s after (a 90% drop).
+cat > "$TMP/nccl-drop.sh" <<EOF
+#!/bin/bash
+n=\$(cat "$STUB_CNT"); echo \$((n+1)) > "$STUB_CNT"
+echo "#   size  count  type  redop  time  algbw  busbw  #wrong"
+if [ "\$n" -eq 0 ]; then bw=100.0; else bw=10.0; fi
+echo "  33554432  8388608  float  sum  820.5  40.89  \$bw  0"
+EOF
+chmod +x "$TMP/nccl-drop.sh"
+# Flat stub: constant 100 GB/s — never trips the threshold.
+cat > "$TMP/nccl-flat.sh" <<'EOF'
+#!/bin/bash
+echo "#hdr"
+echo "  33554432  8388608  float  sum  820.5  40.89  100.0  0"
+EOF
+chmod +x "$TMP/nccl-flat.sh"
+
+# 3-step sweep: the drop stub returns 100 then 10, so the threshold trips on
+# step 2 (of 3) and step 3 is skipped — exercising both the exit-2 path and the
+# halted_early marker (which only appears when completed < planned).
+echo 0 > "$STUB_CNT"
+assert_exit "sweep: 90% busbw drop, --stop-on-degradation 30 → exit 2" 2 \
+    $BIN --dry-run --sweep 1000:3000:1000:1 -M mac --seed 1 \
+        --nccl-binary "$TMP/nccl-drop.sh" --stop-on-degradation 30 \
+        --report="$TMP/deg.json"
+# The halted sweep must mark the report so downstream tooling knows it didn't
+# run to completion (step 3 of 3 never ran).
+assert_stderr_contains "halted sweep report carries halted_early" "halted_early" cat "$TMP/deg.json"
+
+# Same fail-fast contract for a TCO scenario (mirrors the sweep gate).
+printf 'mac 1000 1 nccl\npfc 1000 1 nccl\n' > "$TMP/tco/deg.tco"
+echo 0 > "$STUB_CNT"
+assert_exit "scenario: 90% busbw drop → exit 2" 2 \
+    $BIN --dry-run --scenario "$TMP/tco/deg.tco" --seed 1 \
+        --nccl-binary "$TMP/nccl-drop.sh" --stop-on-degradation 30 \
+        --report="$TMP/degtco.json"
+
+# control: flat busbw never trips, run completes with exit 0
+assert_exit "sweep: flat busbw, no degradation → exit 0" 0 \
+    $BIN --dry-run --sweep 1000:2000:1000:1 -M mac --seed 1 \
+        --nccl-binary "$TMP/nccl-flat.sh" --stop-on-degradation 30 \
+        --report="$TMP/flat.json"
+
+# ------------------------------------------------------------------
+section "24. Non-finite NCCL busbw must not corrupt the report"
+# ------------------------------------------------------------------
+# nccl-tests can print inf/nan in the busbw column on a degenerate run.  The
+# parser drops non-finite rows at the source so no bare inf/nan token reaches
+# the JSON/CSV (which would be invalid JSON and break --diff).
+cat > "$TMP/nccl-inf.sh" <<'EOF'
+#!/bin/bash
+echo "#hdr"
+echo "  33554432  8388608  float  sum  820.5  40.89  inf  0"
+echo "  16777216  4194304  float  sum  410.2  20.10  nan  0"
+EOF
+chmod +x "$TMP/nccl-inf.sh"
+$BIN --dry-run --sweep 1000:2000:1000:1 -M mac --seed 1 \
+    --nccl-binary "$TMP/nccl-inf.sh" --report="$TMP/inf.json" > /dev/null 2>&1
+python3 -c "import json; json.load(open('$TMP/inf.json'))" \
+    && { PASS=$((PASS+1)); echo "  $(green PASS) report with inf/nan NCCL output still parses as JSON"; } \
+    || { FAIL=$((FAIL+1)); echo "  $(red FAIL) non-finite NCCL value produced invalid JSON"; }
+# No step should have recorded a busbw (every row was non-finite → dropped).
+if ! grep -q '"nccl_busbw"' "$TMP/inf.json"; then
+    PASS=$((PASS+1)); echo "  $(green PASS) non-finite rows dropped — no nccl_busbw emitted"
+else
+    FAIL=$((FAIL+1)); echo "  $(red FAIL) a non-finite busbw leaked into the report"
+fi
+
+# ------------------------------------------------------------------
+section "25. Profile sweep-consistency validation (SIGFPE guard)"
+# ------------------------------------------------------------------
+# A profile enabling a sweep without a valid step bypassed the CLI's --sweep
+# check and reached sweep_thread_func with sweep_step=0, where the step-count
+# division is a divide-by-zero (SIGFPE).  The loader now rejects it.
+PDIR3="$TMP/profiles-sweep"
+mkdir -p "$PDIR3"
+export BASIDIUM_PROFILE_DIR="$PDIR3"
+printf 'mode=mac\nsweep_enabled=1\n' > "$PDIR3/nostep.conf"
+assert_exit "reject sweep_enabled with no step" 1 $BIN --profile nostep --print-config
+assert_stderr_contains "sweep-consistency diagnostic" "sweep_enabled requires" \
+    $BIN --profile nostep --print-config
+printf 'mode=mac\nsweep_enabled=1\nsweep_start=1000\nsweep_end=5000\nsweep_step=1000\nsweep_hold=5\n' \
+    > "$PDIR3/goodsweep.conf"
+assert_exit "accept consistent sweep profile" 0 $BIN --profile goodsweep --print-config
+unset BASIDIUM_PROFILE_DIR
+
+# ------------------------------------------------------------------
+section "26. --diff threshold validation + sign tolerance"
+# ------------------------------------------------------------------
+# Thresholds are sign-tolerant ("10" == "-10" == flag a 10% drop) and a
+# malformed value now aborts instead of strtod() silently yielding 0.0, which
+# disabled regression detection and produced a CI false-pass.
+assert_exit "diff: positive busbw threshold still catches -47% drop" 2 \
+    $BIN --diff "$TMP/d-old.json" "$TMP/d-new-bad.json" --diff-threshold-busbw 10
+assert_exit "diff: positive pps threshold still catches -40% drop" 2 \
+    $BIN --diff "$TMP/d-old.json" "$TMP/d-pps-bad.json" --diff-threshold-pps 5
+assert_exit "diff: non-numeric busbw threshold rejected" 1 \
+    $BIN --diff "$TMP/d-old.json" "$TMP/d-new-good.json" --diff-threshold-busbw abc
+assert_exit "diff: non-numeric pps threshold rejected" 1 \
+    $BIN --diff "$TMP/d-old.json" "$TMP/d-new-good.json" --diff-threshold-pps xyz
+
+# ------------------------------------------------------------------
+section "27. -l JSON event log is valid JSON per line"
+# ------------------------------------------------------------------
+# The event log claims JSON-escaped output; pin that every emitted line parses
+# (type and message run through the same escaper write_report uses).
+rm -f "$TMP/events.json"
+$BIN --dry-run -M arp -n 64 -l "$TMP/events.json" --seed 1 > /dev/null 2>&1
+assert_file_nonempty "event log written" "$TMP/events.json"
+log_ok=1
+while IFS= read -r line; do
+    [[ -z $line ]] && continue
+    python3 -c "import json,sys; json.loads(sys.argv[1])" "$line" 2>/dev/null || { log_ok=0; break; }
+done < "$TMP/events.json"
+if [[ $log_ok == 1 ]]; then
+    PASS=$((PASS+1)); echo "  $(green PASS) every -l event-log line parses as JSON"
+else
+    FAIL=$((FAIL+1)); echo "  $(red FAIL) an event-log line is not valid JSON"
 fi
 
 # ------------------------------------------------------------------
